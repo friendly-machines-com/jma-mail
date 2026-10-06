@@ -2269,8 +2269,7 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
             chain_new: result.chain_new,
         }),
         Err(e) => {
-            let s = e.to_string();
-            if s.contains("alreadyExists") {
+            if is_already_exists(&e) {
                 // Reconcile's adopt path should have caught this —
                 // a same-Message-ID server email already exists in
                 // a folder we know about. Hitting this branch means
@@ -2290,6 +2289,23 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
             }
         }
     }
+}
+
+/// `import_email` deliberately adds actionable context at each layer
+/// (`Failed to import email` -> `Set failed: alreadyExists`). Anyhow's
+/// Display/to_string renders only the outermost layer, so checking
+/// `e.to_string().contains("alreadyExists")` can never see Fastmail's
+/// actual SetError and turns an explicitly non-fatal recovery branch
+/// into a hard cycle abort. Walk the complete source chain instead.
+///
+/// This matters most during initial bootstrap: hundreds of successful
+/// per-message commits may precede one already-existing import. Aborting
+/// there withholds mailbox_map and both JMAP cursors, making `jma status`
+/// report "never synced" even though the expensive transfer landed.
+fn is_already_exists(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("alreadyExists"))
 }
 
 #[cfg(test)]
@@ -2983,5 +2999,31 @@ mod tests {
                 other => panic!("expected UploadMessage, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn already_exists_detection_walks_anyhow_context_chain() {
+        use anyhow::Context;
+
+        let error = Err::<(), _>(anyhow::anyhow!("Set failed: alreadyExists"))
+            .context("Failed to import email")
+            .unwrap_err();
+
+        // Pin the premise the chain walk rests on: Display renders only
+        // the outermost layer, so a to_string() search cannot see the
+        // token. If a future anyhow flattens the chain, this fails and
+        // the walk should be re-evaluated rather than left as folklore.
+        assert!(
+            !error.to_string().contains("alreadyExists"),
+            "anyhow Display now flattens the chain; the source-chain walk is no \
+             longer required and this test should be re-evaluated"
+        );
+        assert!(
+            is_already_exists(&error),
+            "source-chain walk must reach the token below the outer context"
+        );
+        assert!(!is_already_exists(&anyhow::anyhow!(
+            "Set failed: invalidProperties"
+        )));
     }
 }
