@@ -747,7 +747,14 @@ async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     }
 
     let maildir_root = config.canonical_maildir_root()?;
-    let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, !apply)?;
+    let tracked_maildir_ids =
+        jma_mail::state::queries::list_tracked_maildir_ids(&conn)?;
+    let plan = jma_mail::janitor::dedupe::run(
+        &maildir_root,
+        &folders,
+        !apply,
+        &tracked_maildir_ids,
+    )?;
 
     if plan.deletions.is_empty() {
         jma_mail::notify!(

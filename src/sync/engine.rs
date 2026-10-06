@@ -291,7 +291,13 @@ impl<'a> SyncEngine<'a> {
         } else {
             Vec::new()
         };
-        let dedupe_plan = crate::janitor::dedupe::run(&maildir_root, &dedupe_targets, dry_run)?;
+        let tracked_maildir_ids = queries::list_tracked_maildir_ids(self.conn)?;
+        let dedupe_plan = crate::janitor::dedupe::run(
+            &maildir_root,
+            &dedupe_targets,
+            dry_run,
+            &tracked_maildir_ids,
+        )?;
         let mut local_index = LocalIndex::default();
         if !queries::has_message_map_rows(self.conn)? {
             for kept in &dedupe_plan.kept {
