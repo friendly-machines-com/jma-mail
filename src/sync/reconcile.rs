@@ -2636,14 +2636,7 @@ mod tests {
             },
         ];
 
-        let plan = run(
-            &[],
-            &[],
-            &changes,
-            &[],
-            &idx,
-            ConflictStrategy::ServerWins,
-        );
+        let plan = run(&[], &[], &changes, &[], &idx, ConflictStrategy::ServerWins);
 
         assert_eq!(plan.upload_count(), 1, "only canonical variant uploads");
         let SyncAction::UploadMessage { id, .. } = &plan.actions[0] else {

@@ -133,13 +133,7 @@ mod tests {
         sleep(Duration::from_millis(20));
         let b = seed_message(dir.path(), "INBOX", "2.host:2,", "<a@x>");
 
-        let plan = run(
-            dir.path(),
-            &["INBOX".to_string()],
-            false,
-            &HashSet::new(),
-        )
-        .unwrap();
+        let plan = run(dir.path(), &["INBOX".to_string()], false, &HashSet::new()).unwrap();
 
         assert_eq!(plan.kept.len(), 1);
         assert_eq!(plan.deletions.len(), 1);
@@ -160,13 +154,7 @@ mod tests {
         sleep(Duration::from_millis(20));
         let b = seed_message(dir.path(), "INBOX", "2.host:2,", "<a@x>");
 
-        let plan = run(
-            dir.path(),
-            &["INBOX".to_string()],
-            true,
-            &HashSet::new(),
-        )
-        .unwrap();
+        let plan = run(dir.path(), &["INBOX".to_string()], true, &HashSet::new()).unwrap();
 
         assert_eq!(plan.deletions.len(), 1);
         assert!(a.exists());
@@ -181,13 +169,7 @@ mod tests {
         let b = seed_message(dir.path(), "INBOX", "2.host:2,", "<a@x>");
         let protected = HashSet::from([MaildirId::from("2.host")]);
 
-        let plan = run(
-            dir.path(),
-            &["INBOX".to_string()],
-            false,
-            &protected,
-        )
-        .unwrap();
+        let plan = run(dir.path(), &["INBOX".to_string()], false, &protected).unwrap();
 
         assert!(plan.deletions.is_empty());
         assert!(a.exists());

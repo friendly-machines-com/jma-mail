@@ -821,9 +821,7 @@ mod tests {
             .enumerate()
         {
             fs::File::open(inbox_path.join("cur").join(name))
-                .and_then(|f| {
-                    f.set_modified(base + std::time::Duration::from_secs(offset as u64))
-                })
+                .and_then(|f| f.set_modified(base + std::time::Duration::from_secs(offset as u64)))
                 .unwrap();
         }
 
