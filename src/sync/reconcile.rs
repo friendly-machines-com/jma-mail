@@ -2211,6 +2211,7 @@ mod tests {
             keywords: flags_to_keywords(flags),
             message_id: message_id.map(|m| vec![m.into()]),
             subject: None,
+            received_at: None,
             size: 0,
         }
     }
