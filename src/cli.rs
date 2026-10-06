@@ -170,6 +170,22 @@ pub enum JanitorAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Preview or destroy an explicit, externally reviewed list of
+    /// JMAP Email ids. The file contains one id per line. Before any
+    /// mutation, every id is checked against the state DB and the
+    /// command refuses the entire operation if even one has a local
+    /// message mapping. Without --yes, only the verified plan is
+    /// printed.
+    Destroyids {
+        /// File containing one opaque JMAP Email id per line. Empty
+        /// lines and lines beginning with '#' are ignored.
+        #[arg(long, value_name = "PATH")]
+        from: std::path::PathBuf,
+        /// Apply the exact destroy list. Without this flag Fastmail
+        /// is queried for verification but nothing is destroyed.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Rebind sentinel-less maildir folders to their JMAP mailboxes
     /// by Message-ID probing. Default mode reports rebind
     /// candidates without writing. Pass --apply to write the
@@ -274,6 +290,25 @@ mod tests {
         assert!(
             Cli::try_parse_from(["jma", "janitor", "remotededupe", "--content-preview=0",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn destroyids_requires_manifest_and_defaults_to_dry_run() {
+        let cli =
+            Cli::try_parse_from(["jma", "janitor", "destroyids", "--from", "reviewed-ids.txt"])
+                .expect("destroyids CLI should parse");
+        let Some(Command::Janitor {
+            action: Some(JanitorAction::Destroyids { from, yes }),
+        }) = cli.command
+        else {
+            panic!("expected janitor destroyids");
+        };
+        assert_eq!(from, std::path::PathBuf::from("reviewed-ids.txt"));
+        assert!(!yes);
+        assert!(
+            Cli::try_parse_from(["jma", "janitor", "destroyids", "--yes"]).is_err(),
+            "--from is mandatory"
         );
     }
 }

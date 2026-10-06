@@ -719,6 +719,7 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
             content_preview,
             yes,
         } => cmd_janitor_remotededupe(cli, mailbox, details, content_preview, yes).await,
+        JanitorAction::Destroyids { from, yes } => cmd_janitor_destroyids(cli, from, yes).await,
         JanitorAction::Rebindfolders {
             sample_size,
             bind,
@@ -887,6 +888,136 @@ async fn cmd_janitor_remotededupe(
                 println!("  [REMOTE-DEDUPE-FAILED] {}", id);
             }
         }
+    }
+    Ok(())
+}
+
+async fn cmd_janitor_destroyids(cli: &Cli, from: std::path::PathBuf, yes: bool) -> Result<()> {
+    use jma_mail::ids::JmapEmailId;
+    use jma_mail::jmap::email::{EmailSetOp, get_by_ids, set_email_batch};
+    use std::collections::HashSet;
+
+    let config = load_config(cli)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
+
+    let contents = std::fs::read_to_string(&from)
+        .with_context(|| format!("Failed to read exact destroy manifest {}", from.display()))?;
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in contents.lines().enumerate() {
+        let value = raw.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        if value.split_whitespace().count() != 1 {
+            anyhow::bail!(
+                "{}:{} must contain exactly one JMAP Email id",
+                from.display(),
+                index + 1
+            );
+        }
+        if !seen.insert(value.to_string()) {
+            anyhow::bail!(
+                "{}:{} repeats JMAP Email id {}",
+                from.display(),
+                index + 1,
+                value
+            );
+        }
+        ids.push(JmapEmailId::from(value));
+    }
+    if ids.is_empty() {
+        anyhow::bail!(
+            "Exact destroy manifest {} contains no JMAP Email ids",
+            from.display()
+        );
+    }
+
+    // This path exists for reviewed remote-only objects. A mapped id has a
+    // local file whose identity depends on it, so one mapped id aborts the
+    // entire manifest rather than silently shrinking a destructive batch.
+    let mut mapped = Vec::new();
+    for id in &ids {
+        if state::queries::get_message_by_jmap_id(&conn, id)?.is_some() {
+            mapped.push(id.clone());
+        }
+    }
+    if !mapped.is_empty() {
+        mapped.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        let values = mapped
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Refusing exact destroy manifest: {} id(s) still have local message_map bindings: {}",
+            mapped.len(),
+            values
+        );
+    }
+
+    let client = session::connect(&config.account, &conn).await?;
+    let chunk_size = jma_mail::jmap::limits::max_objects_in_get(&client);
+    let mut present = HashSet::new();
+    for chunk in ids.chunks(chunk_size) {
+        for email in get_by_ids(&client, chunk).await? {
+            present.insert(email.id);
+        }
+    }
+    let already_absent: Vec<&JmapEmailId> =
+        ids.iter().filter(|id| !present.contains(*id)).collect();
+
+    jma_mail::notify!(
+        "Exact destroy manifest: {} unique id(s), {} present on server, \
+         {} already absent, 0 locally mapped.",
+        ids.len(),
+        present.len(),
+        already_absent.len()
+    );
+    for id in &ids {
+        let disposition = if present.contains(id) {
+            "DESTROY"
+        } else {
+            "ALREADY-ABSENT"
+        };
+        println!("  [{disposition}] {id}");
+    }
+
+    if !yes {
+        jma_mail::notify!(
+            "Dry run only; re-run with --yes to destroy the {} present id(s).",
+            present.len()
+        );
+        return Ok(());
+    }
+    if present.is_empty() {
+        jma_mail::notify!("Exact destroy manifest is already fully applied.");
+        return Ok(());
+    }
+
+    let ops: Vec<EmailSetOp> = ids
+        .iter()
+        .filter(|id| present.contains(*id))
+        .cloned()
+        .map(|email_id| EmailSetOp::Destroy { email_id })
+        .collect();
+    let outcome = set_email_batch(&client, &ops).await?;
+    let failed = outcome.failed_destroys;
+    let succeeded = ops.len() - failed.len();
+    jma_mail::notify!(
+        "Exact destroy: {} destroyed, {} already absent, {} failed.",
+        succeeded,
+        already_absent.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        let mut sorted: Vec<&JmapEmailId> = failed.iter().collect();
+        sorted.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        for id in sorted {
+            println!("  [DESTROY-FAILED] {id}");
+        }
+        anyhow::bail!("{} exact Email destroy(s) failed", failed.len());
     }
     Ok(())
 }
