@@ -2096,8 +2096,9 @@ struct UploadJob {
 
 /// Outcome of a single upload future. `Skipped` covers the
 /// non-fatal cases: oversize-cap, stat failure, read failure, and
-/// the server's `alreadyExists` (logged inside `upload_one`). Hard
-/// JMAP errors are returned as `Err` and propagated by the caller.
+/// permanent per-message import rejections such as `alreadyExists`
+/// and `invalidEmail` (logged inside `upload_one`). Hard account,
+/// transport, and protocol errors are returned as `Err` and propagated.
 /// `Uploaded` carries the Email/import response's
 /// `oldState`/`newState` pair so the cycle-level cursor ratchet can
 /// chain through all imports plus the trailing Email/set.
@@ -2284,6 +2285,20 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
                     id, binding.maildir_folder
                 );
                 Ok(UploadOutcome::Skipped)
+            } else if error_chain_contains(&e, "invalidEmail") {
+                // `invalidEmail` is a permanent rejection of this one
+                // RFC 5322 message, not a failure of the account or sync
+                // transaction. Retrying the unchanged file can never
+                // succeed, and aborting here strands every successful
+                // download plus the mailbox/cursor checkpoint behind one
+                // malformed local draft. Keep the file exactly where it
+                // is, do not record an upload, and let the user repair or
+                // remove it after the rest of the account has converged.
+                warn!(
+                    "Upload of {} from {} was rejected as invalidEmail; keeping the local file but skipping it so the sync checkpoint can complete. Repair or remove the malformed message before retrying it. Server error: {:#}",
+                    id, binding.maildir_folder, e
+                );
+                Ok(UploadOutcome::Skipped)
             } else {
                 Err(e)
             }
@@ -2303,9 +2318,15 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
 /// there withholds mailbox_map and both JMAP cursors, making `jma status`
 /// report "never synced" even though the expensive transfer landed.
 fn is_already_exists(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("alreadyExists"))
+    error_chain_contains(error, "alreadyExists")
+}
+
+/// Search every anyhow context/source layer for a JMAP SetError token.
+/// The outer layer is normally just `Failed to import email`; the useful
+/// per-message rejection (`alreadyExists`, `invalidEmail`, ...) is emitted
+/// by jmap-client underneath it.
+fn error_chain_contains(error: &anyhow::Error, token: &str) -> bool {
+    error.chain().any(|cause| cause.to_string().contains(token))
 }
 
 #[cfg(test)]
@@ -3025,5 +3046,22 @@ mod tests {
         assert!(!is_already_exists(&anyhow::anyhow!(
             "Set failed: invalidProperties"
         )));
+    }
+
+    #[test]
+    fn invalid_email_detection_walks_anyhow_context_chain() {
+        use anyhow::Context;
+
+        let error = Err::<(), _>(anyhow::anyhow!(
+            "Set failed: invalidEmail: Message contains invalid header"
+        ))
+        .context("Failed to import email")
+        .unwrap_err();
+
+        assert!(
+            error_chain_contains(&error, "invalidEmail"),
+            "a permanent per-message rejection must be visible below outer context"
+        );
+        assert!(!error_chain_contains(&error, "alreadyExists"));
     }
 }
