@@ -37,6 +37,7 @@ struct ServerState {
     reject_only_id: Option<String>,
     http_failures: usize,
     lost_replies: usize,
+    omitted_acknowledgements: usize,
     hide_on_get: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// If set, the next Email/changes call returns this error instead
     /// of a normal response. Consumed on use so a follow-up call gets
@@ -144,7 +145,7 @@ fn session_doc(server_uri: &str) -> Value {
         ),
         "uploadUrl": format!("{}/upload/{{accountId}}", server_uri),
         "eventSourceUrl": format!("{}/eventsource", server_uri),
-        "state": "abc123",
+        "state": SESSION_STATE,
     })
 }
 
@@ -742,6 +743,133 @@ async fn flag_inventory_stale_destroy_plan_is_vetoed_at_execution() {
     assert_converged(&fixture, "S").await;
 }
 
+#[tokio::test]
+async fn flag_patch_local_removals_cover_every_mapped_flag() {
+    let mut failures = Vec::new();
+    for flag in ['D', 'F', 'P', 'R', 'S', 'T'] {
+        let fixture =
+            FlagFixture::new(&flag.to_string(), false, ConflictStrategy::ServerWins).await;
+        fixture.local_change("", false, false);
+        let first = fixture.sync().await.unwrap();
+        let snapshot = fixture.snapshot().await;
+        let second = fixture.sync().await.unwrap();
+        if first.failed_remote_actions != 0
+            || snapshot["server_flags"] != ""
+            || !second.already_in_sync
+        {
+            failures.push((flag, snapshot));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "all mapped removals must reach the server: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn flag_patch_removal_with_move_preserves_remote_identity() {
+    let fixture = FlagFixture::new("FS", false, ConflictStrategy::ServerWins).await;
+    fixture.local_change("S", true, false);
+    let result = fixture.sync().await.unwrap();
+    assert_eq!(result.failed_remote_actions, 0);
+    assert_eq!(result.moved, 1);
+    assert_eq!(result.deleted, 0);
+    assert_converged(&fixture, "S").await;
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+#[tokio::test]
+async fn flag_patch_removal_preserves_unmentioned_server_keywords() {
+    let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("S", false, false);
+    assert_eq!(fixture.sync().await.unwrap().failed_remote_actions, 0);
+    assert_converged(&fixture, "S").await;
+    assert!(
+        fixture.snapshot().await["server_keywords"]
+            .get("keep-me")
+            .is_some()
+    );
+    let requests = fixture.state.lock().unwrap().set_requests.clone();
+    let patch = &requests.last().unwrap()["methodCalls"][0][1]["update"]["E1"];
+    assert_eq!(patch.get("keywords/$flagged"), Some(&Value::Null));
+    assert!(patch.get("keywords/keep-me").is_none());
+}
+
+#[tokio::test]
+async fn flag_patch_remove_serializes_null_not_false_or_omission() {
+    let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    let result = crate::jmap::email::set_email_batch(
+        &fixture.verifier,
+        &[crate::jmap::email::EmailSetOp::Keywords {
+            email_id: "E1".into(),
+            keywords: HashMap::from([("$flagged".into(), false)]).into(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(result.failed_updates.is_empty());
+    let requests = fixture.state.lock().unwrap().set_requests.clone();
+    let patch = &requests.last().unwrap()["methodCalls"][0][1]["update"]["E1"];
+    assert_eq!(patch.get("keywords/$flagged"), Some(&Value::Null));
+    assert_eq!(fixture.snapshot().await["server_flags"], "S");
+}
+
+#[tokio::test]
+async fn flag_patch_missing_acknowledgement_is_not_success() {
+    let fixture = FlagFixture::new("", false, ConflictStrategy::ServerWins).await;
+    fixture.local_change("S", false, false);
+    fixture.state.lock().unwrap().omitted_acknowledgements = 1;
+    let first = fixture.sync().await.unwrap();
+    assert_eq!(first.failed_remote_actions, 1);
+    assert_eq!(fixture.snapshot().await["local_baseline"], "");
+    fixture.sync().await.unwrap();
+    assert_converged(&fixture, "S").await;
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+#[tokio::test]
+async fn flag_patch_http_retry_and_ambiguous_applied_write_converge() {
+    for applied in [false, true] {
+        let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+        fixture.local_change("S", false, false);
+        {
+            let mut state = fixture.state.lock().unwrap();
+            if applied {
+                state.lost_replies = 1;
+            } else {
+                state.http_failures = 1;
+            }
+        }
+        assert_eq!(fixture.sync().await.unwrap().failed_remote_actions, 0);
+        assert_converged(&fixture, "S").await;
+        assert_eq!(fixture.state.lock().unwrap().set_requests.len(), 2);
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+    }
+}
+
+#[tokio::test]
+async fn flag_patch_escapes_keyword_pointer_segments() {
+    let fixture = FlagFixture::new("S", false, ConflictStrategy::ServerWins).await;
+    let outcome = crate::jmap::email::set_email_batch(
+        &fixture.verifier,
+        &[crate::jmap::email::EmailSetOp::Keywords {
+            email_id: "E1".into(),
+            keywords: HashMap::from([("user/a~b".into(), true)]).into(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(outcome.failed_updates.is_empty());
+    let requests = fixture.state.lock().unwrap().set_requests.clone();
+    let patch = &requests.last().unwrap()["methodCalls"][0][1]["update"]["E1"];
+    assert_eq!(patch.get("keywords/user~1a~0b"), Some(&json!(true)));
+    assert!(
+        fixture.snapshot().await["server_keywords"]
+            .get("user/a~b")
+            .is_some()
+    );
+}
+
 async fn assert_converged(fixture: &FlagFixture, flags: &str) {
     let snapshot = fixture.snapshot().await;
     assert_eq!(snapshot["file_flags"], flags, "{snapshot}");
@@ -943,6 +1071,11 @@ fn email_set(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
                 not_destroyed.insert(id.as_str().unwrap().to_string(), json!({"type":"notFound"}));
             }
         }
+    }
+    if state.omitted_acknowledgements > 0 {
+        state.omitted_acknowledgements -= 1;
+        updated.clear();
+        destroyed.clear();
     }
     json!(["Email/set", {"accountId":ACCOUNT_ID, "oldState":old, "newState":state.email_state,
         "updated":updated, "notUpdated":not_updated, "destroyed":destroyed, "notDestroyed":not_destroyed}, call_id])

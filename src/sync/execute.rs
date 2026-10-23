@@ -17,6 +17,7 @@ use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
+use crate::keywords::KeywordPatch;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
@@ -1993,10 +1994,9 @@ fn apply_update_local_flags(
 /// `patch` is the keywords map we just sent via `Email/set`'s per-key
 /// `keywords/<name>` shape. Returns the merged HashMap.
 ///
-/// JMAP patch semantics under jmap-client's wire shape: a `true`
-/// value sets (or keeps) the key on the server; a `false` value
-/// serializes as `keywords/<name>: null` and clears the key. Keys
-/// not mentioned in the patch are untouched on the server.
+/// The explicit patch sets present keys and removes cleared keys. The
+/// Email/set encoder emits removals as JSON null; unmentioned keys are
+/// untouched on both the server and this cached observation.
 ///
 /// The mirror's whole point is to reflect that: non-standard server
 /// keywords ($imported, $hasattachment, $x-me-annot-2, user-defined
@@ -2010,11 +2010,8 @@ fn apply_update_local_flags(
 /// degrades to "start with an empty map and apply the patch" --
 /// equivalent to the pre-fix overwrite, but at least the patch
 /// itself lands cleanly. Better than panicking in the mirror.
-fn apply_keyword_patch(
-    existing_json: &str,
-    patch: &HashMap<String, bool>,
-) -> HashMap<String, bool> {
-    let mut merged: HashMap<String, bool> = match serde_json::from_str(existing_json) {
+fn apply_keyword_patch(existing_json: &str, patch: &KeywordPatch) -> HashMap<String, bool> {
+    let merged: HashMap<String, bool> = match serde_json::from_str(existing_json) {
         Ok(m) => m,
         Err(e) => {
             // Self-healing: the next full Email/get round-trip
@@ -2028,14 +2025,7 @@ fn apply_keyword_patch(
             HashMap::new()
         }
     };
-    for (k, v) in patch {
-        if *v {
-            merged.insert(k.clone(), true);
-        } else {
-            merged.remove(k);
-        }
-    }
-    merged
+    patch.apply_to(&merged)
 }
 
 /// DB writes for a single AdoptLocalMessage. Shared between the
@@ -2547,7 +2537,7 @@ mod tests {
         // entries -- they must survive the round-trip.
         patch.insert("$seen".to_string(), true);
 
-        let merged = apply_keyword_patch(existing, &patch);
+        let merged = apply_keyword_patch(existing, &KeywordPatch::from(patch.clone()));
 
         assert_eq!(merged.get("$seen"), Some(&true), "new key must be set");
         assert_eq!(
@@ -2584,7 +2574,7 @@ mod tests {
         patch.insert("$answered".to_string(), false);
         patch.insert("$deleted".to_string(), false);
 
-        let merged = apply_keyword_patch(existing, &patch);
+        let merged = apply_keyword_patch(existing, &KeywordPatch::from(patch.clone()));
 
         assert_eq!(merged.get("$flagged"), Some(&true));
         assert_eq!(merged.get("$seen"), Some(&true));
@@ -2618,8 +2608,8 @@ mod tests {
 
         // "" is malformed JSON per serde_json (same branch as
         // "not json"), not "from_str of empty == empty map".
-        let from_empty = apply_keyword_patch("", &patch);
-        let from_garbage = apply_keyword_patch("not json", &patch);
+        let from_empty = apply_keyword_patch("", &KeywordPatch::from(patch.clone()));
+        let from_garbage = apply_keyword_patch("not json", &KeywordPatch::from(patch));
 
         for merged in [from_empty, from_garbage] {
             assert_eq!(merged.get("$seen"), Some(&true));

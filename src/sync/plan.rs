@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
+use crate::keywords::KeywordPatch;
 
 /// A message known by its local maildir handle. The Message-ID rides
 /// along so logs can name the message in human-readable form, and so
@@ -184,7 +185,7 @@ pub enum SyncAction {
     },
     UpdateRemoteKeywords {
         id: RemoteId,
-        keywords: HashMap<String, bool>,
+        keywords: KeywordPatch,
         /// On-disk maildir filename flag suffix at the time the
         /// patch was emitted -- the filesystem-truth view of flags,
         /// mirrored by every emit site from the same source it used

@@ -124,7 +124,7 @@ fn seen_and_move(id: &str) -> Vec<EmailSetOp> {
     vec![
         EmailSetOp::Keywords {
             email_id: id.into(),
-            keywords: HashMap::from([("$seen".into(), true)]),
+            keywords: HashMap::from([("$seen".into(), true)]).into(),
         },
         EmailSetOp::SetMailboxes {
             email_id: id.into(),
@@ -166,7 +166,7 @@ async fn email_set_batch_merges_patches_and_uses_last_value() {
     let ops = vec![
         EmailSetOp::Keywords {
             email_id: "E1".into(),
-            keywords: HashMap::from([("$seen".into(), false)]),
+            keywords: HashMap::from([("$seen".into(), false)]).into(),
         },
         EmailSetOp::SetMailboxes {
             email_id: "E1".into(),
@@ -174,7 +174,7 @@ async fn email_set_batch_merges_patches_and_uses_last_value() {
         },
         EmailSetOp::Keywords {
             email_id: "E1".into(),
-            keywords: HashMap::from([("$flagged".into(), true)]),
+            keywords: HashMap::from([("$flagged".into(), true)]).into(),
         },
         EmailSetOp::SetMailboxes {
             email_id: "E1".into(),
@@ -182,7 +182,7 @@ async fn email_set_batch_merges_patches_and_uses_last_value() {
         },
         EmailSetOp::Keywords {
             email_id: "E1".into(),
-            keywords: HashMap::from([("$seen".into(), true)]),
+            keywords: HashMap::from([("$seen".into(), true)]).into(),
         },
     ];
     set_email_batch(&client, &ops).await.unwrap();
@@ -295,7 +295,7 @@ async fn check_executor_move(rejected: bool) {
             },
             SyncAction::UpdateRemoteKeywords {
                 id,
-                keywords: keywords.clone(),
+                keywords: keywords.clone().into(),
                 filename_flags: "S".into(),
             },
             SyncAction::AdoptLocalMessage {

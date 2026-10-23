@@ -1180,7 +1180,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
                     jmap_email_id: m.jmap_email_id.clone(),
                     message_id: m.message_id.clone(),
                 },
-                keywords,
+                keywords: flags_to_keyword_patch(&m.new_flags),
                 filename_flags: m.new_flags.clone(),
             });
         }
@@ -1360,7 +1360,7 @@ fn handle_known_remote(
                             jmap_email_id: email.id.clone(),
                             message_id: existing.message_id.clone(),
                         },
-                        keywords: flags_to_keywords(new_flags),
+                        keywords: flags_to_keyword_patch(new_flags),
                         filename_flags: new_flags.clone(),
                     });
                 }
@@ -2034,7 +2034,7 @@ fn handle_local_flags(
             jmap_email_id: msg.jmap_email_id.clone(),
             message_id: msg.message_id.clone(),
         },
-        keywords: flags_to_keywords(new_flags),
+        keywords: flags_to_keyword_patch(new_flags),
         filename_flags: new_flags.to_string(),
     });
 }
@@ -2734,14 +2734,13 @@ mod tests {
             "filename_flags must carry the on-disk suffix so the mirror writes \
              local_state.flags = filename rather than deriving from the patch"
         );
-        // Explicit-six patch: every standard keyword present with the
-        // local file's value, $forwarded explicitly false to clear it.
-        assert_eq!(keywords.get("$flagged"), Some(&true));
-        assert_eq!(keywords.get("$seen"), Some(&true));
-        assert_eq!(keywords.get("$forwarded"), Some(&false));
-        assert_eq!(keywords.get("$draft"), Some(&false));
-        assert_eq!(keywords.get("$answered"), Some(&false));
-        assert_eq!(keywords.get("$deleted"), Some(&false));
+        use crate::keywords::KeywordMutation::{Remove, Set};
+        assert_eq!(keywords.get("$flagged"), Some(&Set));
+        assert_eq!(keywords.get("$seen"), Some(&Set));
+        assert_eq!(keywords.get("$forwarded"), Some(&Remove));
+        assert_eq!(keywords.get("$draft"), Some(&Remove));
+        assert_eq!(keywords.get("$answered"), Some(&Remove));
+        assert_eq!(keywords.get("$deleted"), Some(&Remove));
         assert!(
             !keywords.contains_key("$imported"),
             "patch must leave non-standard server keywords alone: {:?}",

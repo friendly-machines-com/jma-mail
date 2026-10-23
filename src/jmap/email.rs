@@ -18,6 +18,7 @@ use crate::jmap::build_request;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
+use crate::keywords::{KeywordMutation, KeywordPatch};
 
 /// True iff `err`'s anyhow chain carries a JMAP method-level
 /// `cannotCalculateChanges`. Walks the chain and downcasts to
@@ -378,10 +379,10 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
 /// destroys into Email/set method calls.
 #[derive(Debug, Clone)]
 pub enum EmailSetOp {
-    /// Patch keywords on an email. Map is `keyword -> set?`.
+    /// Explicit keyword set/remove operations; not a replacement set.
     Keywords {
         email_id: JmapEmailId,
-        keywords: HashMap<String, bool>,
+        keywords: KeywordPatch,
     },
     /// Replace the email's full mailbox-id set. The caller computes
     /// the target set; `set_email_batch` issues a full-replacement
@@ -446,7 +447,7 @@ impl EmailSetOutcome {
 
 #[derive(Default)]
 struct EmailSetUpdate<'a> {
-    keywords: HashMap<&'a str, bool>,
+    keywords: HashMap<&'a str, KeywordMutation>,
     target_mailbox_ids: Option<&'a [JmapMailboxId]>,
 }
 
@@ -518,38 +519,56 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
         }
     }
 
+    let http = super::email_set::http_client(client)?;
     let chunk_size = limits::max_objects_in_set(client);
     let mut combined = EmailSetOutcome::default();
     let mut chunk_count = 0usize;
 
     for chunk in objects.chunks(chunk_size) {
         let chunk_outcome = with_retry("Email/set (batch)", || async {
-            let mut request = build_request(client);
-            {
-                let set = request.set_email().account_id(client.default_account_id());
-                for object in chunk {
-                    match object {
-                        EmailSetObject::Update(email_id) => {
-                            let update = &updates[email_id];
-                            let upd = set.update(email_id.as_ref());
-                            for (kw, val) in &update.keywords {
-                                upd.keyword(kw, *val);
-                            }
-                            if let Some(target_mailbox_ids) = update.target_mailbox_ids {
-                                upd.mailbox_ids(target_mailbox_ids.iter());
-                            }
+            let mut update_rows = serde_json::Map::new();
+            let mut destroy_ids = Vec::new();
+            for object in chunk {
+                match object {
+                    EmailSetObject::Update(email_id) => {
+                        let update = &updates[email_id];
+                        let mut patch = serde_json::Map::new();
+                        for (keyword, mutation) in &update.keywords {
+                            let path = format!(
+                                "keywords/{}",
+                                keyword.replace('~', "~0").replace('/', "~1")
+                            );
+                            let value = match mutation {
+                                KeywordMutation::Set => serde_json::Value::Bool(true),
+                                KeywordMutation::Remove => serde_json::Value::Null,
+                            };
+                            patch.insert(path, value);
                         }
-                        EmailSetObject::Destroy(email_id) => {
-                            set.destroy([email_id.as_ref()]);
+                        if let Some(mailbox_ids) = update.target_mailbox_ids {
+                            let ids = mailbox_ids
+                                .iter()
+                                .map(|id| (id.to_string(), serde_json::Value::Bool(true)))
+                                .collect();
+                            patch.insert("mailboxIds".into(), serde_json::Value::Object(ids));
                         }
+                        update_rows.insert(email_id.to_string(), serde_json::Value::Object(patch));
                     }
+                    EmailSetObject::Destroy(email_id) => destroy_ids.push(email_id.to_string()),
                 }
             }
-
-            let response = request
-                .send_single::<jmap_client::core::response::EmailSetResponse>()
-                .await
-                .context("Email/set batch failed")?;
+            let mut args = serde_json::Map::new();
+            args.insert(
+                "accountId".into(),
+                serde_json::Value::String(client.default_account_id().into()),
+            );
+            if !update_rows.is_empty() {
+                args.insert("update".into(), serde_json::Value::Object(update_rows));
+            }
+            if !destroy_ids.is_empty() {
+                args.insert("destroy".into(), serde_json::to_value(destroy_ids)?);
+            }
+            let response =
+                super::email_set::send(client, &http, serde_json::Value::Object(args)).await?;
 
             let chain_old = response.old_state().map(String::from);
             // jmap-client 0.4.1 returns "" when `newState` is missing
@@ -581,6 +600,33 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
                 }
             }
 
+            let updated: std::collections::HashSet<_> = response
+                .updated_ids()
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            let destroyed: std::collections::HashSet<_> = response
+                .destroyed_ids()
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            for object in chunk {
+                match object {
+                    EmailSetObject::Update(id) if !updated.contains(id.as_ref()) => {
+                        if outcome.failed_updates.insert((*id).clone()) {
+                            warn!("Email/set did not acknowledge update {}", id);
+                        }
+                    }
+                    EmailSetObject::Destroy(id) if !destroyed.contains(id.as_ref()) => {
+                        if outcome.failed_destroys.insert((*id).clone()) {
+                            warn!("Email/set did not acknowledge destroy {}", id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Ok(outcome)
         })
         .await?;
