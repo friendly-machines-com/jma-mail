@@ -134,7 +134,7 @@ Two distinct identifiers anchor the system:
 - **JMAP `email_id`** -- stable per server, lives in `message_map`.
 - **RFC 5322 `Message-ID`** -- stable across both sides, survives a state DB wipe.
 
-The state DB is **disposable**. Nuking `state.db` and re-running must converge on the existing maildir without re-downloading or duplicating files. That property is enforced by:
+The state DB is **rebuildable, not a lossless journal**. Recreating it starts a new reconciliation from the current maildir and server state. Message-ID-based adoption is intended to reuse existing files rather than download another copy; it cannot reconstruct the history of changes made before the reset. The current recovery mechanisms are:
 
 1. `sync::dedupe::plan_dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and classifies the newest by mtime within each group as a duplicate. Newer copies are presumed to be jma-introduced duplicates from a prior aborted run. Groups containing a cross-subdir pair (one candidate in `cur/`, one in `new/`) whose qmail unique ids are in an extending-prefix relationship are exempt from deletion -- every realistic MUA preserves the unique across `rename(2)` promotion, and mbsync additionally appends `,U=<imap-uid>` to it, so such a pair is the signature of a `rename(2)` we observed across two separate readdirs rather than two distinct duplicates. The pair stays on disk, `plan.kept` still emits an entry for `LocalIndex`, and the cycle after the promotion's caller settles the pair collapses to in-subdir and gets cleaned then. Cross-subdir pairs with unrelated uniques are *not* exempt -- those are real duplicates (e.g., jma re-delivered into `new/` while a different copy already lived in `cur/`) and get normal mtime-based dedupe. Returns a `DedupePlan { kept, deletions }` without touching disk; `SyncEngine::run` uses `plan.kept` to build a `LocalIndex` keyed on Message-ID and calls `sync::dedupe::apply_dedupe` to **delete** the planned duplicates on non-dry-run cycles only. Under `--dry-run` the deletions are surfaced in the printed plan instead of executed.
 
@@ -151,12 +151,22 @@ There is no in-place migration system. Whenever the SQLite schema or the invaria
 On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
-- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jma sharing this DB can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` logs a warning and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. There is no confirmation prompt or automatic backup. The caller is required to hold the state DB lock, preventing another cooperating jma from using the DB during the unlink. This lock prevents that race; it does not make discarding synchronization history lossless.
 - **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jma sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
 
 Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
 
-When you bump `SCHEMA_VERSION`, you don't need to write migration code -- but you DO need to mention the field/invariant change in the commit message, and ideally add a regression test that constructs an old-schema DB on disk and checks `open_or_recreate` rebuilds correctly.
+When you bump `SCHEMA_VERSION`, the current implementation rebuilds rather than migrates. Mention the field/invariant change and the recovery consequences in the commit message, and test the old-schema open path. Do not infer that every future state addition can safely be discarded merely because the current open path does so.
+
+### What a DB rebuild can recover
+
+The unlink itself removes only the DB and its WAL/SHM files, not maildir messages. The subsequent sync is a normal mutating sync: it can adopt, download, upload, deduplicate, change flags, or propagate deletions according to the inputs and configured policy. It is not a read-only reconstruction operation.
+
+Current data does not uniquely determine the lost history. For example, local flags `S` and remote flags `FS` can mean either that both sides previously had `FS` and the user unflagged locally, or that both previously had `S` and another client flagged remotely. Without the previous synchronized snapshots, those histories are indistinguishable. A fresh adoption may use the configured conflict strategy, but cannot promise the same result as finishing the interrupted reconciliation.
+
+Rebuilding therefore does not promise to preserve unacknowledged flag intent, replay an interrupted operation, restore a destroyed JMAP Email id, or recover server-only metadata from a local filename. Adoption also requires a usable Message-ID and an unambiguous supported match; Message-ID alone is not proof of byte identity.
+
+Before a reset or an upgrade/downgrade that may trigger one, stop concurrent mutators and back up the DB with a consistent SQLite backup (or copy it only after closing all connections, including any WAL state). Preserve the maildir as well. Treat a rebuild as a fresh reconciliation with explicit policy, not as transparent crash recovery. Normal restart recovery with the DB intact is a separate guarantee and must be tested separately.
 
 ## Concurrency model
 
