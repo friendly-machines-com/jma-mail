@@ -393,6 +393,8 @@ This ordering is load-bearing in a few places:
 - **Pull side before push side.** We want the local DB to settle to its post-pull state before we tell the server about local changes -- both because the conflict resolution in reconcile assumed the pull would land first, and because failed pushes leave the DB in a state where the next cycle can still see the original local changes.
 - **Remote-set batched.** `apply_remote_set` collects every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` for `set_email_batch`. That function merges keyword patches and mailbox replacements for each Email id into one update before splitting by `maxObjectsInSet`; each combined update and each destroy counts as one object. It calls jmap-client's `set.update(id)` only once per id, because a second call replaces the first update rather than extending it. This keeps a move and its flag changes in the same per-object update. Per-id failures return in `failed_updates` and `failed_destroys`; we mirror successes into the DB while skipping the failures.
 
+Flag-sync regression tests in `src/sync/flag_tests.rs` run actual `SyncEngine` cycles against real temporary Maildirs and a stateful JMAP model. The model applies patches, rejects invalid keyword values, and exposes fresh `Email/get` results; assertions compare those results with filenames, DB views, and later idle cycles. These tests do not replace the Docker-backed Stalwart tests, which remain a separate integration check.
+
 #### Per-handler responsibilities
 
 Each handler is a small function that destructures the action, performs the I/O, and writes the DB. The pattern is consistent:

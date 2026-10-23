@@ -5,3 +5,6 @@ pub mod execute;
 pub mod plan;
 pub mod reconcile;
 pub mod self_writes;
+
+#[cfg(test)]
+mod flag_tests;
