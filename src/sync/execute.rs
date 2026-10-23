@@ -279,6 +279,7 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
+            deferred_actions: remote_counts.deferred,
             // Engine sets these from the unfiltered plan / bindings;
             // executor doesn't have the visibility to compute them.
             already_in_sync: false,
@@ -1082,18 +1083,46 @@ impl<'a> Executor<'a> {
                 });
             }
         }
-        for action in &destroys {
-            if let SyncAction::DestroyRemote { id } = action {
-                ops.push(EmailSetOp::Destroy {
-                    email_id: id.jmap_email_id.clone(),
-                });
+        let mut deferred_destroys = HashSet::new();
+        if !destroys.is_empty() {
+            let mailboxes = queries::get_all_mailboxes(self.conn)?;
+            let inventory = crate::maildir_ops::scan::inventory_identities(
+                &self.maildir_root,
+                mailboxes
+                    .iter()
+                    .map(|mailbox| mailbox.maildir_folder.as_str()),
+            )?;
+            for action in &destroys {
+                if let SyncAction::DestroyRemote { id } = action {
+                    let record = queries::get_message_by_jmap_id(self.conn, &id.jmap_email_id)?;
+                    let still_present = record
+                        .as_ref()
+                        .and_then(|record| record.maildir_id.as_ref())
+                        .is_some_and(|maildir_id| {
+                            mailboxes.is_empty() || inventory.contains(maildir_id, &id.message_id)
+                        });
+                    if still_present {
+                        warn!(
+                            "Withholding remote destroy for {}: a local identity candidate is still present",
+                            id
+                        );
+                        deferred_destroys.insert(id.jmap_email_id.clone());
+                    } else {
+                        ops.push(EmailSetOp::Destroy {
+                            email_id: id.jmap_email_id.clone(),
+                        });
+                    }
+                }
             }
         }
 
         if ops.is_empty() {
             return Ok((
                 jmap_email::EmailSetOutcome::default(),
-                ApplyRemoteSetCounts::default(),
+                ApplyRemoteSetCounts {
+                    deferred: deferred_destroys.len(),
+                    ..Default::default()
+                },
             ));
         }
 
@@ -1107,7 +1136,10 @@ impl<'a> Executor<'a> {
         let txn = self.conn.unchecked_transaction()?;
 
         // Mirror keyword updates into the local DB.
-        let mut counts = ApplyRemoteSetCounts::default();
+        let mut counts = ApplyRemoteSetCounts {
+            deferred: deferred_destroys.len(),
+            ..Default::default()
+        };
         for action in keywords {
             let SyncAction::UpdateRemoteKeywords {
                 id,
@@ -1194,6 +1226,9 @@ impl<'a> Executor<'a> {
             let SyncAction::DestroyRemote { id } = action else {
                 continue;
             };
+            if deferred_destroys.contains(&id.jmap_email_id) {
+                continue;
+            }
             if outcome.failed_destroys.contains(&id.jmap_email_id) {
                 warn!(
                     "DestroyRemote {} rejected by server. \
@@ -2121,6 +2156,7 @@ struct ApplyRemoteSetCounts {
     keyword_updates: usize,
     moves: usize,
     destroys: usize,
+    deferred: usize,
 }
 
 /// Aggregated result of `upload_messages`. Carries the per-import

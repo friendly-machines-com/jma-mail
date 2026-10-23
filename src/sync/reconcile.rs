@@ -271,7 +271,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         // share an id but disagree on `maildir_folder` (e.g. a rename
         // that wasn't applied to local_state yet), and we want the
         // move-pair path to fire in that case too.
-        if dst_binding == src_binding {
+        if dst_binding == src_binding && new_id == old_id {
             continue;
         }
 

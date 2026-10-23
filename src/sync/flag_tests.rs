@@ -613,6 +613,135 @@ use crate::maildir_ops::flags::{flags_to_keywords, keywords_to_flags};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[tokio::test]
+async fn flag_inventory_move_to_new_preserves_remote_identity() {
+    let fixture = FlagFixture::new("F", false, ConflictStrategy::ServerWins).await;
+    fixture.local_change("F", true, true);
+    let result = fixture.sync().await.unwrap();
+    assert_eq!(result.deleted, 0, "a mailbox move is not a remote deletion");
+    assert_eq!(result.moved, 1);
+    assert_converged(&fixture, "F").await;
+    assert_eq!(fixture.snapshot().await["file_folder"], "Deleted Items");
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+#[tokio::test]
+async fn flag_inventory_live_new_addition_is_detected() {
+    let fixture = FlagFixture::new("", false, ConflictStrategy::ServerWins).await;
+    fixture.local_change("F", false, true);
+    assert_eq!(fixture.sync().await.unwrap().flag_updates, 1);
+    assert_converged(&fixture, "F").await;
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+#[tokio::test]
+async fn flag_inventory_new_suffix_matches_the_maildir_reader() {
+    let fixture = FlagFixture::new("F", false, ConflictStrategy::ServerWins).await;
+    let record = queries::get_message_by_jmap_id(&fixture.conn, &"E1".into())
+        .unwrap()
+        .unwrap();
+    let id = record.maildir_id.unwrap();
+    let maildir =
+        crate::maildir_ops::store::ensure_maildir(&fixture.temp.path().join("INBOX")).unwrap();
+    let entry = maildir.list_new().next().unwrap().unwrap();
+    assert_eq!(entry.flags(), "F");
+    let binding = Arc::new(crate::domain::MailboxFolderBinding {
+        jmap_mailbox_id: crate::domain::MaybeReference::Value("MB-INBOX".into()),
+        server_name: "INBOX".into(),
+        maildir_folder: "INBOX".into(),
+        remote_path: "INBOX".into(),
+    });
+    let known = HashMap::from([(id.clone(), ("MB-INBOX".into(), "F".into()))]);
+    let scan = crate::maildir_ops::scan::scan_folder(&maildir, &binding, &known).unwrap();
+    assert_eq!(scan.local_flags[&id], "F");
+}
+
+#[tokio::test]
+async fn flag_inventory_source_only_move_event_is_revalidated() {
+    let fixture = FlagFixture::new("F", false, ConflictStrategy::ServerWins).await;
+    let source = fixture.file();
+    fixture.local_change("F", true, true);
+    let engine = SyncEngine::connect(&fixture.conn, &fixture.config)
+        .await
+        .unwrap();
+    let result = engine
+        .run(
+            false,
+            crate::sync::plan::SyncDirection::Both,
+            crate::sync::engine::ScanScope::Paths(vec![source]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.deleted, 0);
+    assert_eq!(result.moved, 1);
+    assert_converged(&fixture, "F").await;
+}
+
+#[tokio::test]
+async fn flag_inventory_untracked_new_is_not_implicitly_uploaded() {
+    let fixture = FlagFixture::new("S", false, ConflictStrategy::ServerWins).await;
+    let path = fixture.temp.path().join("INBOX/new/999999999.local:2,F");
+    std::fs::write(
+        &path,
+        b"Message-ID: <local-only@example.com>\r\n\r\nbody\r\n",
+    )
+    .unwrap();
+    let result = fixture.sync().await.unwrap();
+    assert_eq!(result.uploaded, 0);
+    assert_eq!(result.deleted, 0);
+    assert!(path.exists());
+    assert_eq!(fixture.state.lock().unwrap().emails.len(), 1);
+}
+
+#[tokio::test]
+async fn flag_inventory_changed_id_new_move_defers_remote_destruction() {
+    let fixture = FlagFixture::new("F", false, ConflictStrategy::ServerWins).await;
+    let source = fixture.file();
+    let target = fixture
+        .temp
+        .path()
+        .join("Deleted Items/new/999999999.changed:2,F");
+    std::fs::rename(source, &target).unwrap();
+    let result = fixture.sync().await.unwrap();
+    assert_eq!(
+        result.deleted, 0,
+        "a live identity candidate forbids destructive inference"
+    );
+    assert!(target.exists());
+    assert_eq!(result.deferred_actions, 1);
+    assert!(!result.already_in_sync);
+    assert_eq!(fixture.state.lock().unwrap().emails.len(), 1);
+}
+
+#[tokio::test]
+async fn flag_inventory_stale_destroy_plan_is_vetoed_at_execution() {
+    let fixture = FlagFixture::new("S", false, ConflictStrategy::ServerWins).await;
+    let client = jmap_client::client::Client::new()
+        .credentials("test-token")
+        .connect(&fixture._server.uri())
+        .await
+        .unwrap();
+    let executor =
+        crate::sync::execute::Executor::new(Arc::new(client), &fixture.conn, &fixture.config, None)
+            .unwrap();
+    let result = executor
+        .execute(crate::sync::plan::SyncPlan {
+            actions: vec![crate::sync::plan::SyncAction::DestroyRemote {
+                id: crate::sync::plan::RemoteId {
+                    jmap_email_id: "E1".into(),
+                    message_id: "audit@example.com".into(),
+                },
+            }],
+            new_email_state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.deleted, 0);
+    assert_eq!(result.deferred_actions, 1);
+    assert!(fixture.state.lock().unwrap().set_requests.is_empty());
+    assert_converged(&fixture, "S").await;
+}
+
 async fn assert_converged(fixture: &FlagFixture, flags: &str) {
     let snapshot = fixture.snapshot().await;
     assert_eq!(snapshot["file_flags"], flags, "{snapshot}");

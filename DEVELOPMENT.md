@@ -369,6 +369,8 @@ After remote-side actions are settled, walk `local_changes` again:
 - `FlagsChanged`: emit `UpdateRemoteKeywords` unless the server also changed flags (already handled in `handle_known_remote`).
 - `DeletedMessage`: emit `DestroyRemote` unless `consumed_deletes` (move pre-pass), `destroyed_set` (server already destroyed it), or `deletes_overruled_by_server` says so.
 
+The local scan observes suffixes in both `cur/` and `new/`. Tracked new-side files participate in flag and move classification; unknown new-side files are not implicitly uploaded. Classification uses the tracked state across mailboxes, not only the destination folder's rows. A path-only result containing a deletion candidate is widened to a full inventory before reconciliation. If a live identity candidate still prevents establishing a unique move or a real deletion, the engine defers the destructive action and reports `deferred_actions` rather than claiming an idle synchronized state. The executor repeats the presence check before adding remote destroys to a request; unreadable inventory fails closed, and a live candidate prevents the request and its DB cleanup.
+
 #### Invariants reconcile maintains
 
 - Reconcile never reads the network or the filesystem; all inputs are passed in. This makes it cheap to add tests.

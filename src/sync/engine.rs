@@ -3,7 +3,7 @@ use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -77,6 +77,9 @@ pub struct SyncOutcome {
     /// are self-healing -- the next cycle re-detects and re-attempts
     /// each rejected action -- so they stay below the `error!` bar.
     pub failed_remote_actions: usize,
+    /// Local changes deferred because the current inventory cannot establish
+    /// a safe identity transition. These are not successful synchronization.
+    pub deferred_actions: usize,
     /// True when reconcile produced an empty plan -- neither side had
     /// work to do. The daemon uses this to flag spurious `LocalChange`
     /// triggers (FS notification fired but nothing actually changed)
@@ -206,7 +209,7 @@ impl<'a> SyncEngine<'a> {
         &self,
         dry_run: bool,
         direction: SyncDirection,
-        scan_scope: ScanScope,
+        mut scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
         let mut mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.canonical_maildir_root()?;
@@ -322,103 +325,96 @@ impl<'a> SyncEngine<'a> {
             .sync
             .allow_destructive_folder_sync
             .allows_delete_local();
-        let (scan_changes, local_flags) = {
-            let _phase =
-                tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
-            match &scan_scope {
-                ScanScope::Full => {
-                    let mut changes = Vec::new();
-                    let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
-                    for binding in mailboxes.scan_set(include_orphans) {
-                        let maildir_path = maildir_root.join(&binding.maildir_folder);
-                        // Three reasons a binding's maildir might
-                        // not exist on disk:
-                        //   - First-cycle binding awaiting
-                        //     `CreateLocalMailbox` (filtered via
-                        //     `is_new_mailbox`).
-                        //   - Sentinel survived elsewhere (the
-                        //     user `mv`-ed the folder; rename
-                        //     detection in `resolve_mailboxes` is
-                        //     authoritative).
-                        //   - Sentinel gone everywhere -- the user
-                        //     deleted the folder.
-                        // Only the third emits
-                        // `LocalChange::LocalFolderDeleted`; the
-                        // first two skip silently. Pull-side
-                        // orphan bindings (only present under
-                        // `include_orphans`) aren't in `by_id`, so
-                        // the live-binding check filters them too.
-                        let Some(maildir) = store::try_open_maildir(&maildir_path) else {
-                            if let MaybeReference::Value(id) = &binding.jmap_mailbox_id
-                                && mailboxes.by_id(id).is_some()
-                                && !mailboxes.is_new_mailbox(id)
-                                && !mailboxes.sentinel_survives_for(id)
-                            {
-                                changes.push(scan::LocalChange::LocalFolderDeleted {
-                                    binding: Arc::clone(&binding),
-                                });
-                            }
-                            continue;
-                        };
-                        let known_state = hydrate_known_state(self.conn, &binding)?;
-                        let result = scan::scan_folder(&maildir, &binding, &known_state)?;
-                        changes.extend(result.changes);
-                        local_flags.extend(result.local_flags);
-                    }
-                    // Folder-discovery pass: enumerate maildir-shaped
-                    // directories under `maildir_root` that no binding
-                    // covers and emit a `LocalFolderCreated` for each.
-                    // Walk strategy is layout-aware -- see
-                    // `scan::discover_unbound_folders`. Full-scope is
-                    // the comprehensive sweep that catches folders
-                    // created while the daemon wasn't running (or
-                    // missed by fsevents); `scan_paths` emits the same
-                    // variant per-event for folders the watcher saw
-                    // live, so both scopes converge on the same shape.
-                    changes.extend(scan::discover_unbound_folders(
-                        &maildir_root,
-                        self.config.sync.folder_layout,
-                        mailboxes.index(),
-                    ));
-                    (changes, local_flags)
-                }
-                ScanScope::Paths(paths) => {
-                    let mut known_states = HashMap::new();
-                    for binding in mailboxes.scan_set(include_orphans) {
-                        // Path-driven cycles only fire for fsevent
-                        // paths the watcher already saw, so a
-                        // maildir-shaped folder absent at this
-                        // point means no events referenced it.
-                        // Skip the state hydration for absent
-                        // folders rather than creating them as a
-                        // side effect.
-                        //
-                        // Push-side orphan detection
-                        // (`LocalFolderDeleted` emission for an
-                        // absent maildir) lives only in the
-                        // Full-scope branch above; Paths cycles
-                        // converge on the next periodic Full
-                        // sweep (or post-disconnect catchup),
-                        // since `scan_paths` operates on event
-                        // paths rather than bindings.
-                        if store::try_open_maildir(&maildir_root.join(&binding.maildir_folder))
-                            .is_none()
-                        {
-                            continue;
+        let mut scan_states = HashMap::new();
+        let mut global_scan_state = HashMap::new();
+        for binding in mailboxes.scan_set(include_orphans) {
+            let state = hydrate_known_state(self.conn, &binding)?;
+            global_scan_state.extend(state.clone());
+            scan_states.insert(binding.maildir_folder.clone(), state);
+        }
+        let (scan_changes, local_flags) = loop {
+            let scanned = {
+                let _phase =
+                    tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
+                match &scan_scope {
+                    ScanScope::Full => {
+                        let mut changes = Vec::new();
+                        let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
+                        for binding in mailboxes.scan_set(include_orphans) {
+                            let maildir_path = maildir_root.join(&binding.maildir_folder);
+                            // Three reasons a binding's maildir might
+                            // not exist on disk:
+                            //   - First-cycle binding awaiting
+                            //     `CreateLocalMailbox` (filtered via
+                            //     `is_new_mailbox`).
+                            //   - Sentinel survived elsewhere (the
+                            //     user `mv`-ed the folder; rename
+                            //     detection in `resolve_mailboxes` is
+                            //     authoritative).
+                            //   - Sentinel gone everywhere -- the user
+                            //     deleted the folder.
+                            // Only the third emits
+                            // `LocalChange::LocalFolderDeleted`; the
+                            // first two skip silently. Pull-side
+                            // orphan bindings (only present under
+                            // `include_orphans`) aren't in `by_id`, so
+                            // the live-binding check filters them too.
+                            let Some(maildir) = store::try_open_maildir(&maildir_path) else {
+                                if let MaybeReference::Value(id) = &binding.jmap_mailbox_id
+                                    && mailboxes.by_id(id).is_some()
+                                    && !mailboxes.is_new_mailbox(id)
+                                    && !mailboxes.sentinel_survives_for(id)
+                                {
+                                    changes.push(scan::LocalChange::LocalFolderDeleted {
+                                        binding: Arc::clone(&binding),
+                                    });
+                                }
+                                continue;
+                            };
+                            let result = scan::scan_folder(&maildir, &binding, &global_scan_state)?;
+                            changes.extend(result.changes);
+                            local_flags.extend(result.local_flags);
                         }
-                        let state = hydrate_known_state(self.conn, &binding)?;
-                        known_states.insert(binding.maildir_folder.clone(), state);
+                        // Folder-discovery pass: enumerate maildir-shaped
+                        // directories under `maildir_root` that no binding
+                        // covers and emit a `LocalFolderCreated` for each.
+                        // Walk strategy is layout-aware -- see
+                        // `scan::discover_unbound_folders`. Full-scope is
+                        // the comprehensive sweep that catches folders
+                        // created while the daemon wasn't running (or
+                        // missed by fsevents); `scan_paths` emits the same
+                        // variant per-event for folders the watcher saw
+                        // live, so both scopes converge on the same shape.
+                        changes.extend(scan::discover_unbound_folders(
+                            &maildir_root,
+                            self.config.sync.folder_layout,
+                            mailboxes.index(),
+                        ));
+                        (changes, local_flags)
                     }
-                    let result = scan::scan_paths(
-                        &maildir_root,
-                        paths,
-                        &known_states,
-                        mailboxes.index(),
-                        self.config.sync.folder_layout,
-                    )?;
-                    (result.changes, result.local_flags)
+                    ScanScope::Paths(paths) => {
+                        let result = scan::scan_paths(
+                            &maildir_root,
+                            paths,
+                            &scan_states,
+                            mailboxes.index(),
+                            self.config.sync.folder_layout,
+                        )?;
+                        (result.changes, result.local_flags)
+                    }
                 }
+            };
+            if matches!(scan_scope, ScanScope::Paths(_))
+                && scanned
+                    .0
+                    .iter()
+                    .any(|change| matches!(change, LocalChange::DeletedMessage { .. }))
+            {
+                debug!("Partial scan contains a deletion candidate; widening to a full inventory");
+                scan_scope = ScanScope::Full;
+                continue;
             }
+            break scanned;
         };
 
         // Suppress scan's view of files plan_dedupe flagged for
@@ -429,44 +425,48 @@ impl<'a> SyncEngine<'a> {
         // filter reconcile would print a plan with phantom actions
         // for the soon-to-be-deduped duplicates, lying about what a
         // real `jma sync` would do.
-        let all_local_changes: Vec<LocalChange> = if dry_run && !dedupe_plan.deletions.is_empty() {
-            let suppressed: HashSet<(String, MaildirId)> = dedupe_plan
-                .deletions
-                .iter()
-                .map(|d| (d.folder.clone(), d.maildir_id.clone()))
-                .collect();
-            scan_changes
-                .into_iter()
-                .filter(|c| {
-                    let key = match c {
-                        LocalChange::NewMessage {
-                            binding,
-                            maildir_id,
-                            ..
-                        }
-                        | LocalChange::FlagsChanged {
-                            binding,
-                            maildir_id,
-                            ..
-                        }
-                        | LocalChange::DeletedMessage {
-                            binding,
-                            maildir_id,
-                            ..
-                        } => (binding.maildir_folder.clone(), maildir_id.clone()),
-                        // Folder-lifecycle variants are not message-level
-                        // and don't participate in dedupe; always pass
-                        // through.
-                        LocalChange::LocalFolderCreated { .. }
-                        | LocalChange::LocalFolderDeleted { .. }
-                        | LocalChange::LocalFolderRenamed { .. } => return true,
-                    };
-                    !suppressed.contains(&key)
-                })
-                .collect()
-        } else {
-            scan_changes
-        };
+        let mut all_local_changes: Vec<LocalChange> =
+            if dry_run && !dedupe_plan.deletions.is_empty() {
+                let suppressed: HashSet<(String, MaildirId)> = dedupe_plan
+                    .deletions
+                    .iter()
+                    .map(|d| (d.folder.clone(), d.maildir_id.clone()))
+                    .collect();
+                scan_changes
+                    .into_iter()
+                    .filter(|c| {
+                        let key = match c {
+                            LocalChange::NewMessage {
+                                binding,
+                                maildir_id,
+                                ..
+                            }
+                            | LocalChange::FlagsChanged {
+                                binding,
+                                maildir_id,
+                                ..
+                            }
+                            | LocalChange::DeletedMessage {
+                                binding,
+                                maildir_id,
+                                ..
+                            } => (binding.maildir_folder.clone(), maildir_id.clone()),
+                            // Folder-lifecycle variants are not message-level
+                            // and don't participate in dedupe; always pass
+                            // through.
+                            LocalChange::LocalFolderCreated { .. }
+                            | LocalChange::LocalFolderDeleted { .. }
+                            | LocalChange::LocalFolderRenamed { .. } => return true,
+                        };
+                        !suppressed.contains(&key)
+                    })
+                    .collect()
+            } else {
+                scan_changes
+            };
+
+        let deferred_actions =
+            defer_ambiguous_deletes(self.conn, &maildir_root, &mailboxes, &mut all_local_changes)?;
 
         // Convert `LocalChange::LocalFolderDeleted` events into
         // entries on `mailboxes.remote_orphans()`. Scan emits the
@@ -620,7 +620,8 @@ impl<'a> SyncEngine<'a> {
         // removal would be a lie under both dry-run (the user is
         // about to see them in the plan) and non-dry-run (apply_dedupe
         // just ran and removed them).
-        let already_in_sync = plan.is_empty() && dedupe_plan.deletions.is_empty();
+        let already_in_sync =
+            plan.is_empty() && dedupe_plan.deletions.is_empty() && deferred_actions == 0;
 
         if dry_run {
             if !dedupe_plan.deletions.is_empty() {
@@ -639,6 +640,7 @@ impl<'a> SyncEngine<'a> {
             print!("{}", plan);
             return Ok(SyncOutcome {
                 already_in_sync,
+                deferred_actions,
                 ..Default::default()
             });
         }
@@ -700,6 +702,7 @@ impl<'a> SyncEngine<'a> {
             ))
             .await?;
         outcome.already_in_sync = already_in_sync;
+        outcome.deferred_actions += deferred_actions;
         outcome.remote_orphans_detected = mailboxes.remote_orphans().len();
         outcome.remote_orphan_total_emails = mailboxes
             .remote_orphans()
@@ -1440,6 +1443,67 @@ fn hydrate_known_state(
         .into_iter()
         .map(|(id, (_folder, flags))| (id, (mailbox_id.clone(), flags)))
         .collect())
+}
+
+/// A partial or ambiguous inventory must not authorize a remote destroy.
+/// Exact move pairs remain for reconcile; other live identity candidates
+/// defer the deletion without implicitly importing an unknown new/ file.
+fn defer_ambiguous_deletes(
+    conn: &Connection,
+    root: &Path,
+    mailboxes: &MailboxBindings,
+    changes: &mut Vec<LocalChange>,
+) -> Result<usize> {
+    if !changes
+        .iter()
+        .any(|change| matches!(change, LocalChange::DeletedMessage { .. }))
+    {
+        return Ok(0);
+    }
+    let known = build_known_indices(conn, mailboxes)?;
+    let mut candidates = HashMap::new();
+    for change in changes.iter() {
+        let LocalChange::DeletedMessage { maildir_id, .. } = change else {
+            continue;
+        };
+        let Some(record) = known.by_maildir.get(maildir_id) else {
+            continue;
+        };
+        let pairs = changes
+            .iter()
+            .filter(|other| {
+                matches!(other,
+                    LocalChange::NewMessage { message_id, .. } if message_id == &record.message_id
+                )
+            })
+            .count();
+        if pairs != 1 {
+            candidates.insert(maildir_id.clone(), record.message_id.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let bindings = mailboxes.scan_set(true);
+    let inventory = scan::inventory_identities(
+        root,
+        bindings
+            .iter()
+            .map(|binding| binding.maildir_folder.as_str()),
+    )?;
+    let deferred: HashSet<_> = candidates.into_iter().filter_map(|(id, message_id)| {
+        let live = inventory.contains(&id, &message_id);
+        if live {
+            warn!("Deferring deletion of {}: a live identity candidate still exists in cur/ or new/", id);
+            Some(id)
+        } else { None }
+    }).collect();
+    changes.retain(|change| {
+        !matches!(change,
+            LocalChange::DeletedMessage { maildir_id, .. } if deferred.contains(maildir_id)
+        )
+    });
+    Ok(deferred.len())
 }
 
 /// Build the three message_map projections the reconcile step consumes.

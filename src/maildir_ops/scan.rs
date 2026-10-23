@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use maildir::Maildir;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,11 +13,11 @@ use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
 use crate::maildir_ops::store;
 
-/// One live `cur/` entry passed into `classify_changes`. Both
+/// One live message entry passed into `classify_changes`. Both
 /// `scan_folder` (full enumeration via the maildir crate) and
 /// `scan_paths` (partial, driven by fsevents) build these from their
 /// respective inputs so the classifier sees a uniform shape.
-struct CurEntry {
+struct FileEntry {
     maildir_id: MaildirId,
     flags: String,
     path: PathBuf,
@@ -44,6 +44,62 @@ struct CurEntry {
 pub struct ScanResult {
     pub changes: Vec<LocalChange>,
     pub local_flags: HashMap<MaildirId, String>,
+}
+
+/// A fresh presence check used before interpreting disappearance as deletion.
+pub(crate) struct IdentityInventory {
+    ids: HashSet<MaildirId>,
+    message_ids: HashSet<String>,
+}
+
+impl IdentityInventory {
+    pub(crate) fn contains(&self, id: &MaildirId, message_id: &MessageId) -> bool {
+        self.ids.contains(id)
+            || self
+                .message_ids
+                .contains(message_id.as_ref().trim_matches(['<', '>']))
+    }
+}
+
+pub(crate) fn inventory_identities<'a>(
+    root: &Path,
+    folders: impl IntoIterator<Item = &'a str>,
+) -> Result<IdentityInventory> {
+    let mut inventory = IdentityInventory {
+        ids: HashSet::new(),
+        message_ids: HashSet::new(),
+    };
+    for folder in folders {
+        for subdir in ["cur", "new"] {
+            let directory = root.join(folder).join(subdir);
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Cannot verify message presence in {}", directory.display())
+                    });
+                }
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                inventory
+                    .ids
+                    .insert(MaildirId::from(name.split(":2,").next().unwrap_or(&name)));
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                if let Some(id) = parse_message_id_from_file(&entry.path())? {
+                    inventory
+                        .message_ids
+                        .insert(id.as_ref().trim_matches(['<', '>']).to_string());
+                }
+            }
+        }
+    }
+    Ok(inventory)
 }
 
 /// A change detected in the local maildir.
@@ -176,18 +232,13 @@ pub enum LocalChange {
 ///   serves both exhaustive (folder-walk) and event-driven
 ///   (fsevents) deletion sources without an extra mode flag.
 ///
-/// Live new/ entries aren't passed in: jma (as the MDA) is the only
-/// writer to new/, MUAs only ever promote new/ -> cur/, and anything
-/// delivered to new/ is tracked in the DB at write time. Any later
-/// MUA promotion shows up through the cur/ scan as either a
-/// NewMessage (post-DB-wipe rescue) or a FlagsChanged. The caller
-/// (scan_folder / scan_paths) still observes new/ entries so it can
-/// build its own observed-on-disk set before deciding which DB-
-/// anchored ids belong in `explicit_deletes`, but classify_changes
-/// itself has no use for them.
+/// Tracked new/ entries are classified too: their suffixes and mailbox
+/// locations can change without promotion to cur/. Unknown new/ entries
+/// are observed for identity/adoption and deletion safety, but are not
+/// implicitly imported by this classifier.
 fn classify_changes(
     binding: &Arc<MailboxFolderBinding>,
-    cur_entries: &[CurEntry],
+    cur_entries: &[FileEntry],
     explicit_deletes: &[MaildirId],
     known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<Vec<LocalChange>> {
@@ -299,7 +350,7 @@ pub fn scan_folder(
     let mut cur_entries = Vec::new();
     for entry in maildir.list_cur() {
         let entry = entry?;
-        cur_entries.push(CurEntry {
+        cur_entries.push(FileEntry {
             maildir_id: MaildirId::from(entry.id()),
             flags: entry.flags().to_string(),
             path: entry.path().to_path_buf(),
@@ -309,23 +360,19 @@ pub fn scan_folder(
     let mut new_entries = Vec::new();
     for entry in maildir.list_new() {
         let entry = entry?;
-        new_entries.push(MaildirId::from(entry.id()));
+        new_entries.push(FileEntry {
+            maildir_id: MaildirId::from(entry.id()),
+            flags: entry.flags().to_string(),
+            path: entry.path().to_path_buf(),
+        });
     }
 
-    // Per-file filename-flag-suffix map for reconcile's adoption
-    // emit sites. Built from the same `entry.flags()` reads
-    // classify_changes inspects -- no extra I/O. new/ ids carry an
-    // empty suffix because the maildir crate doesn't expose flags
-    // for new/ entries (and the spec doesn't define them there);
-    // they're included for completeness so a downstream lookup
-    // never misses due to placement.
+    // The pinned Maildir dependency exposes suffixes in both directories.
+    // Observing new/ is separate from importing an unknown new message.
     let mut local_flags: HashMap<MaildirId, String> =
         HashMap::with_capacity(cur_entries.len() + new_entries.len());
-    for entry in &cur_entries {
+    for entry in cur_entries.iter().chain(&new_entries) {
         local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
-    }
-    for id in &new_entries {
-        local_flags.entry(id.clone()).or_default();
     }
 
     // Exhaustive deletion detection: any DB entry anchored to this
@@ -335,7 +382,7 @@ pub fn scan_folder(
     let observed: HashSet<&MaildirId> = cur_entries
         .iter()
         .map(|e| &e.maildir_id)
-        .chain(new_entries.iter())
+        .chain(new_entries.iter().map(|entry| &entry.maildir_id))
         .collect();
     let explicit_deletes: Vec<MaildirId> = known_state
         .iter()
@@ -353,6 +400,13 @@ pub fn scan_folder(
         })
         .collect();
 
+    // Tracked new/ files can change flags or move between mailboxes just
+    // like cur/ files. Untracked new/ files remain observation-only.
+    cur_entries.extend(
+        new_entries
+            .into_iter()
+            .filter(|entry| known_state.contains_key(&entry.maildir_id)),
+    );
     let changes = classify_changes(binding, &cur_entries, &explicit_deletes, known_state)?;
     Ok(ScanResult {
         changes,
@@ -385,16 +439,11 @@ pub fn scan_folder(
 /// of `classify_changes` and reconcile pairs the two halves by
 /// Message-ID.
 ///
-/// Cross-folder deletion semantic depends on coalescing: both halves
-/// of a move (source-delete and dest-create renames) need to land in
-/// the same `scan_paths` call so the source folder's "live path
-/// missing" emits `DeletedMessage(src)` and the destination folder's
-/// "live path present, DB anchors elsewhere" emits `NewMessage(dst)`,
-/// for reconcile to pair. The daemon's trigger loop holds open a
-/// coalesce window for exactly this reason; if that window were ever
-/// removed or set too tight to cover back-to-back debouncer batches,
-/// a split move would degrade into destroy + reupload, losing the
-/// JMAP id, thread, and keyword history.
+/// Coalescing both halves of a move lets this scan pair the source
+/// and destination cheaply. A one-sided result is only a deletion
+/// candidate: the engine widens such results to a full inventory
+/// before authorizing a remote destroy. Correctness must not depend
+/// on both rename events arriving in one debouncer batch.
 ///
 /// Limitation: events the watcher never received (macOS
 /// `MustScanSubDirs` drops, jma offline) leave drift this function
@@ -413,7 +462,11 @@ pub fn scan_paths(
     type GroupEntry = (String, String, PathBuf);
     // Per-folder classification input: cur/ live entries, new/ ids,
     // and ids that disappeared (live path missing).
-    type FolderBucket = (Vec<CurEntry>, Vec<MaildirId>, Vec<MaildirId>);
+    type FolderBucket = (Vec<FileEntry>, Vec<FileEntry>, Vec<MaildirId>);
+    let global_known: HashMap<_, _> = known_states
+        .values()
+        .flat_map(|state| state.iter().map(|(id, value)| (id.clone(), value.clone())))
+        .collect();
 
     // Per-event dispatch, in order:
     //   1. Parse the path; drop if it doesn't fit the
@@ -491,15 +544,21 @@ pub fn scan_paths(
 
         let bucket = by_folder.entry(folder.clone()).or_default();
         match live {
-            Some((subdir, flags, path)) if subdir == "cur" => {
-                bucket.0.push(CurEntry {
+            Some((subdir, flags, path))
+                if subdir == "cur" || global_known.contains_key(&maildir_id) =>
+            {
+                bucket.0.push(FileEntry {
                     maildir_id,
                     flags: flags.clone(),
                     path: path.clone(),
                 });
             }
-            Some(_) => {
-                bucket.1.push(maildir_id);
+            Some((_, flags, path)) => {
+                bucket.1.push(FileEntry {
+                    maildir_id,
+                    flags: flags.clone(),
+                    path: path.clone(),
+                });
             }
             None => {
                 if let Some((known_mailbox_id, _)) = known_state.get(&maildir_id)
@@ -523,7 +582,7 @@ pub fn scan_paths(
         // Same defensive guard as above; by_folder is built from
         // `groups`, which was filtered against `known_states`, so this
         // should always succeed.
-        let Some(known_state) = known_states.get(&folder) else {
+        let Some(_) = known_states.get(&folder) else {
             debug!(
                 "scan_paths: known_states missing folder {} at classify; skipping",
                 folder
@@ -533,8 +592,8 @@ pub fn scan_paths(
         for entry in &cur {
             local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
         }
-        for id in &new {
-            local_flags.entry(id.clone()).or_default();
+        for entry in &new {
+            local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
         }
         let Some(binding) = index.by_folder(&folder) else {
             debug!(
@@ -543,7 +602,7 @@ pub fn scan_paths(
             );
             continue;
         };
-        let changes = classify_changes(binding, &cur, &deletes, known_state)?;
+        let changes = classify_changes(binding, &cur, &deletes, &global_known)?;
         all_changes.extend(changes);
     }
 
