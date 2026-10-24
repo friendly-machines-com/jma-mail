@@ -106,6 +106,8 @@ pub enum SyncAction {
     DeferredFlagState {
         id: RemoteId,
         reason: String,
+        /// True only when an autonomous fresh cycle can finish the work.
+        retryable: bool,
     },
     // Server -> Local
     DownloadMessage {
@@ -670,7 +672,7 @@ impl fmt::Display for SyncPlan {
                 SyncAction::RecordFlagState { id, .. } => {
                     writeln!(f, "  [STATE] Record flag baseline for {}", id)?
                 }
-                SyncAction::DeferredFlagState { id, reason } => {
+                SyncAction::DeferredFlagState { id, reason, .. } => {
                     writeln!(f, "  [PENDING] {}: {}", id, reason)?
                 }
                 SyncAction::DownloadMessage { id, binding, .. } => writeln!(

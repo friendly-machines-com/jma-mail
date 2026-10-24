@@ -24,7 +24,7 @@ use crate::state::{flag_sync, queries};
 use crate::sync::bindings::{MailboxBindings, MailboxBindingsBuilder};
 use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
-use crate::sync::plan::{SyncAction, SyncDirection};
+use crate::sync::plan::{SyncAction, SyncDirection, SyncPlan};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
 use crate::sync::self_writes::SelfWriteCache;
 use tracing::Instrument;
@@ -40,11 +40,16 @@ use tracing::Instrument;
 pub enum ScanScope {
     Full,
     Paths(Vec<PathBuf>),
+    /// Full inventory for retained message work, without reissuing confirmed
+    /// permanent Email/set rejections or flag histories needing review.
+    Retry {
+        blocked_remote_ids: HashSet<JmapEmailId>,
+    },
 }
 
 /// Outcome of one sync iteration -- enough for the daemon loop to know
 /// whether to fire the post-arrival hook and to flag a degraded cycle.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SyncOutcome {
     pub downloaded: usize,
     /// Local messages successfully pushed to the server via
@@ -73,10 +78,27 @@ pub struct SyncOutcome {
     /// (notUpdated + notDestroyed). Each one is also logged at warn
     /// level with id and folder context; this count is the
     /// at-a-glance summary so the user doesn't have to grep across a
-    /// long cycle log to notice anything went wrong. These conditions
-    /// are self-healing -- the next cycle re-detects and re-attempts
-    /// each rejected action -- so they stay below the `error!` bar.
+    /// long cycle log to notice anything went wrong. Retryable failures
+    /// remain eligible for a fresh cycle; permanent rejections require
+    /// permission repair or explicit reassessment, not a transport retry.
     pub failed_remote_actions: usize,
+    /// Failed Email/set IDs eligible for automatic retry, including missing
+    /// positive acknowledgement. Confirmed permanent rejection is excluded.
+    pub retryable_remote_actions: usize,
+    /// Daemon-lifetime suppression for confirmed permanent Email/set rejection.
+    /// This is not a durable job queue; a normal Full/manual cycle may retry.
+    pub blocked_remote_ids: HashSet<JmapEmailId>,
+    /// Actual local flag/move effects which failed, not direction-filtered or
+    /// membership-gated effects which were never attempted.
+    pub retryable_local_actions: usize,
+    /// Deferred observations/effects explicitly eligible for a fresh cycle.
+    pub retryable_deferred_actions: usize,
+    /// Explicit review/ambiguity deferrals, distinct from effects merely
+    /// waiting for a retryable membership acknowledgement.
+    pub review_actions: usize,
+    /// True only after a non-preview, bidirectional full inventory. A Paths
+    /// no-op cannot clear a daemon's outstanding retry deadline.
+    pub retry_scope_checked: bool,
     /// Local changes deferred because the current inventory cannot establish
     /// a safe identity transition. These are not successful synchronization.
     pub deferred_actions: usize,
@@ -84,6 +106,8 @@ pub struct SyncOutcome {
     pub pending_flag_actions: usize,
     /// Pending flag histories that require explicit review or permission repair.
     pub blocked_flag_actions: usize,
+    /// Bound selected messages which have no acknowledgement-history row yet.
+    pub unverified_flag_actions: usize,
     /// True when reconcile produced an empty plan -- neither side had
     /// work to do. The daemon uses this to flag spurious `LocalChange`
     /// triggers (FS notification fired but nothing actually changed)
@@ -103,6 +127,51 @@ pub struct SyncOutcome {
     /// in `remote_orphans_detected`. Same post-resurrect semantics:
     /// resurrected orphans don't contribute.
     pub remote_orphan_total_emails: u64,
+}
+
+impl SyncOutcome {
+    pub fn needs_retry(&self) -> bool {
+        self.pending_flag_actions > self.blocked_flag_actions
+            || self.retryable_remote_actions > 0
+            || self.retryable_local_actions > 0
+            || self.retryable_deferred_actions > 0
+    }
+
+    pub fn has_blocked_work(&self) -> bool {
+        self.blocked_flag_actions > 0
+            || !self.blocked_remote_ids.is_empty()
+            || self.review_actions > 0
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.pending_flag_actions > 0
+            || self.has_blocked_work()
+            || self.unverified_flag_actions > 0
+            || self.failed_remote_actions > 0
+            || self.deferred_actions > 0
+            || self.retryable_local_actions > 0
+    }
+
+    fn observe_flag_status(&mut self, status: &flag_sync::FlagPending) {
+        self.pending_flag_actions = status.pending.len();
+        self.blocked_flag_actions = status.blocked.len();
+        self.unverified_flag_actions = status.unverified.len();
+    }
+
+    pub fn pending_summary(&self) -> String {
+        format!(
+            "flags: {} pending ({} blocked/review), {} unverified; remote: {} retryable, {} blocked; local: {} retryable; deferred: {} ({} retryable, {} review)",
+            self.pending_flag_actions,
+            self.blocked_flag_actions,
+            self.unverified_flag_actions,
+            self.retryable_remote_actions,
+            self.blocked_remote_ids.len(),
+            self.retryable_local_actions,
+            self.deferred_actions,
+            self.retryable_deferred_actions,
+            self.review_actions
+        )
+    }
 }
 
 /// Bundles the immutable state every engine helper threads through
@@ -215,13 +284,21 @@ impl<'a> SyncEngine<'a> {
         direction: SyncDirection,
         mut scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
-        if matches!(scan_scope, ScanScope::Paths(_))
-            && (flag_sync::has_unverified(self.conn)?
-                || !flag_sync::pending_ids(self.conn, true)?.is_empty())
-        {
+        let (retry_only, blocked_remote_ids) = match &scan_scope {
+            ScanScope::Retry { blocked_remote_ids } => (true, blocked_remote_ids.clone()),
+            _ => (false, HashSet::new()),
+        };
+        if retry_only {
             scan_scope = ScanScope::Full;
         }
         let mut mailboxes = self.resolve_mailboxes().await?;
+        let flag_scope = flag_mailbox_ids(&mailboxes);
+        let pending_before = flag_sync::summarize(self.conn, &flag_scope)?;
+        if matches!(scan_scope, ScanScope::Paths(_))
+            && (pending_before.retryable() > 0 || !pending_before.unverified.is_empty())
+        {
+            scan_scope = ScanScope::Full;
+        }
         let maildir_root = self.config.canonical_maildir_root()?;
 
         // Push-only on a fresh config has nothing local to upload:
@@ -347,7 +424,7 @@ impl<'a> SyncEngine<'a> {
                 let _phase =
                     tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
                 match &scan_scope {
-                    ScanScope::Full => {
+                    ScanScope::Full | ScanScope::Retry { .. } => {
                         let mut changes = Vec::new();
                         let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
                         for binding in mailboxes.scan_set(include_orphans) {
@@ -544,10 +621,17 @@ impl<'a> SyncEngine<'a> {
         // so they bypass this entirely and always fetch.
         if matches!(scan_scope, ScanScope::Paths(_)) && all_local_changes.is_empty() {
             debug!("Path-scan produced no local changes; skipping remote fetch");
-            return Ok(SyncOutcome {
-                already_in_sync: true,
+            let mut outcome = SyncOutcome {
+                deferred_actions,
+                review_actions: deferred_actions,
                 ..Default::default()
-            });
+            };
+            outcome.observe_flag_status(&pending_before);
+            outcome.already_in_sync = !outcome.has_pending_work();
+            if outcome.has_pending_work() {
+                crate::notify!("Sync incomplete ({})", outcome.pending_summary());
+            }
+            return Ok(outcome);
         }
 
         // Phase 2: collect remote changes.
@@ -572,6 +656,7 @@ impl<'a> SyncEngine<'a> {
         // Verification reads are observations, not Email/changes events.
         // In particular they must not create a spurious delete/update conflict.
         let mut known = build_known_indices(self.conn, &mailboxes)?;
+        known.retry_only = retry_only;
         let observed: HashSet<_> = remote_emails.iter().map(|email| email.id.clone()).collect();
         let destroyed: HashSet<_> = remote_destroyed.iter().cloned().collect();
         let verify: Vec<_> = known
@@ -581,15 +666,20 @@ impl<'a> SyncEngine<'a> {
                 record.maildir_id.is_some()
                     && !observed.contains(&record.jmap_email_id)
                     && !destroyed.contains(&record.jmap_email_id)
-                    && known
-                        .flag_sync
-                        .get(&record.jmap_email_id)
-                        .is_some_and(|state| {
-                            state.legacy
-                                || state.review
-                                || state.baseline.is_none()
-                                || state.attempt.is_some()
-                        })
+                    && (record.jmap_blob_id.is_none()
+                        || record.jmap_thread_id.is_none()
+                        || serde_json::from_str::<HashMap<String, bool>>(&record.jmap_keywords)
+                            .is_err()
+                        || known
+                            .flag_sync
+                            .get(&record.jmap_email_id)
+                            .is_some_and(|state| {
+                                state.legacy
+                                    || state.review
+                                    || state.baseline.is_none()
+                                    || state.attempt.is_some()
+                                    || state.error.is_some()
+                            }))
             })
             .map(|record| record.jmap_email_id.clone())
             .collect();
@@ -606,7 +696,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Phase 3: build a pure plan from observations and acknowledged state.
-        let plan = {
+        let mut plan = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "reconcile").entered();
             reconcile::reconcile(ReconcileInput {
@@ -625,6 +715,12 @@ impl<'a> SyncEngine<'a> {
                 hierarchy_separator: self.config.sync.hierarchy_separator,
                 maildir_root: &maildir_root,
             })
+        };
+
+        let withheld_remote = if retry_only {
+            defer_blocked_remote_actions(&mut plan, &blocked_remote_ids)
+        } else {
+            HashSet::new()
         };
 
         // Structural write barrier: folder-level primitives
@@ -683,11 +779,20 @@ impl<'a> SyncEngine<'a> {
                 println!();
             }
             print!("{}", plan);
-            return Ok(SyncOutcome {
-                already_in_sync,
+            let mut outcome = SyncOutcome {
                 deferred_actions,
+                review_actions: deferred_actions,
                 ..Default::default()
-            });
+            };
+            outcome.observe_flag_status(&pending_before);
+            outcome.already_in_sync = already_in_sync && !outcome.has_pending_work();
+            if outcome.has_pending_work() {
+                println!(
+                    "Existing pending work (unchanged by preview): {}",
+                    outcome.pending_summary()
+                );
+            }
+            return Ok(outcome);
         }
 
         // An empty plan still has to flow through the executor so the
@@ -746,9 +851,13 @@ impl<'a> SyncEngine<'a> {
                 "execute",
             ))
             .await?;
-        outcome.already_in_sync =
-            already_in_sync && outcome.pending_flag_actions == 0 && outcome.deferred_actions == 0;
+        outcome.observe_flag_status(&flag_sync::summarize(self.conn, &flag_scope)?);
+        outcome.blocked_remote_ids.extend(withheld_remote);
+        outcome.retry_scope_checked =
+            matches!(scan_scope, ScanScope::Full) && matches!(direction, SyncDirection::Both);
         outcome.deferred_actions += deferred_actions;
+        outcome.review_actions += deferred_actions;
+        outcome.already_in_sync = already_in_sync && !outcome.has_pending_work();
         outcome.remote_orphans_detected = mailboxes.remote_orphans().len();
         outcome.remote_orphan_total_emails = mailboxes
             .remote_orphans()
@@ -823,8 +932,10 @@ impl<'a> SyncEngine<'a> {
             warn!("Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}");
         }
 
-        if already_in_sync {
+        if outcome.already_in_sync {
             crate::notify!("Already in sync");
+        } else if outcome.has_pending_work() {
+            crate::notify!("Sync incomplete ({})", outcome.pending_summary());
         } else if used_initial_path {
             crate::notify!(
                 "Initial sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
@@ -1552,6 +1663,80 @@ fn defer_ambiguous_deletes(
     Ok(deferred.len())
 }
 
+fn flag_mailbox_ids(mailboxes: &MailboxBindings) -> Vec<JmapMailboxId> {
+    mailboxes
+        .scan_set(true)
+        .iter()
+        .map(|binding| {
+            binding
+                .jmap_mailbox_id
+                .expect_resolved("flag history scope")
+                .clone()
+        })
+        .collect()
+}
+
+/// A timer must not turn another ID's retry into repeated attempts of a
+/// confirmed permanent rejection. This mask is daemon-lifetime state only;
+/// ordinary event/manual cycles can reassess the request with fresh inputs.
+fn defer_blocked_remote_actions(
+    plan: &mut SyncPlan,
+    blocked: &HashSet<JmapEmailId>,
+) -> HashSet<JmapEmailId> {
+    let held: HashMap<_, _> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::UpdateRemoteKeywords { id, .. }
+            | SyncAction::MoveRemote { id, .. }
+            | SyncAction::DestroyRemote { id }
+                if blocked.contains(&id.jmap_email_id) =>
+            {
+                Some((id.jmap_email_id.clone(), id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if held.is_empty() {
+        return HashSet::new();
+    }
+    let held_moves: HashSet<_> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::MoveRemote { id, .. } if held.contains_key(&id.jmap_email_id) => {
+                Some(id.jmap_email_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    plan.actions.retain(|action| match action {
+        SyncAction::UpdateRemoteKeywords { id, .. }
+        | SyncAction::MoveRemote { id, .. }
+        | SyncAction::DestroyRemote { id } => !held.contains_key(&id.jmap_email_id),
+        SyncAction::AdoptLocalMessage {
+            id,
+            old_maildir_id: Some(_),
+            ..
+        }
+        | SyncAction::UpdateLocalFlags { id, .. }
+        | SyncAction::ObserveMessage { id, .. } => !held_moves.contains(&id.jmap_email_id),
+        _ => true,
+    });
+    plan.new_email_state = None;
+    let ids = held.keys().cloned().collect();
+    plan.actions.extend(held.into_values().map(|id| {
+        SyncAction::DeferredFlagState {
+            id,
+            retryable: false,
+            reason:
+                "Confirmed permanent remote rejection; a normal event/manual cycle must reassess it"
+                    .into(),
+        }
+    }));
+    ids
+}
+
 /// Build the three message_map projections the reconcile step consumes.
 /// Free function rather than a `SyncEngine` method because it only
 /// needs `&Connection` -- keeping it free lets the in-module unit tests
@@ -1569,7 +1754,7 @@ fn build_known_indices(
     mailboxes: &MailboxBindings,
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
-    let flag_states = flag_sync::load(conn)?;
+    let flag_states = flag_sync::load_for_mailboxes(conn, &flag_mailbox_ids(mailboxes))?;
 
     // Pending flag histories in local orphans must remain visible to the
     // destructive-folder conflict pass too, even without a new local delta.
@@ -2601,6 +2786,38 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_outcomes_distinguish_retryable_membership_waits_from_review() {
+        let retryable = SyncOutcome {
+            failed_remote_actions: 1,
+            retryable_remote_actions: 1,
+            deferred_actions: 1,
+            ..Default::default()
+        };
+        assert!(retryable.needs_retry() && retryable.has_pending_work());
+        assert!(
+            !retryable.has_blocked_work(),
+            "a gated pull awaiting a retryable ACK is not review work"
+        );
+        let review = SyncOutcome {
+            deferred_actions: 1,
+            review_actions: 1,
+            ..Default::default()
+        };
+        assert!(review.has_pending_work() && review.has_blocked_work());
+        assert!(!review.needs_retry());
+        let unverified = SyncOutcome {
+            unverified_flag_actions: 1,
+            ..Default::default()
+        };
+        assert!(unverified.has_pending_work());
+        assert!(
+            !unverified.needs_retry(),
+            "verification scheduling follows the actual deferred classification"
+        );
+    }
+
     use crate::ids::{JmapEmailId, MaildirId, MessageId};
     use crate::state::db;
     use crate::state::queries::MessageRecord;

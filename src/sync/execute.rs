@@ -109,6 +109,8 @@ impl<'a> Executor<'a> {
         let mut observations = Vec::new();
         let mut flag_states = Vec::new();
         let mut deferred_flags = 0;
+        let mut retryable_deferred_actions = 0;
+        let mut review_actions = 0;
         let mut remote_mailbox_destroys = Vec::new();
         let mut local_creates = Vec::new();
         let mut local_renames = Vec::new();
@@ -130,9 +132,18 @@ impl<'a> Executor<'a> {
             match action {
                 SyncAction::ObserveMessage { .. } => observations.push(action),
                 SyncAction::RecordFlagState { .. } => flag_states.push(action),
-                SyncAction::DeferredFlagState { id, reason } => {
-                    warn!("Flags for {} remain pending: {}", id, reason);
+                SyncAction::DeferredFlagState {
+                    id,
+                    reason,
+                    retryable,
+                } => {
+                    warn!(
+                        "Flags for {} remain pending (retryable={}): {}",
+                        id, retryable, reason
+                    );
                     deferred_flags += 1;
+                    retryable_deferred_actions += usize::from(retryable);
+                    review_actions += usize::from(!retryable);
                 }
                 SyncAction::CreateLocalMailbox { .. } => local_creates.push(action),
                 SyncAction::RenameLocalMailbox { .. } => local_renames.push(action),
@@ -205,6 +216,7 @@ impl<'a> Executor<'a> {
         let (move_pair_flags, local_flags): (Vec<_>, Vec<_>) = local_flags.into_iter().partition(|action| {
             matches!(action, SyncAction::UpdateLocalFlags { id, .. } if paired_ids.contains(&id.jmap_email_id))
         });
+        let mut local_flags_actually_attempted = local_flags.len();
         let mut local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_attempted = local_moves.len();
         let local_moves_count = self.move_local_messages(local_moves)?;
@@ -267,9 +279,11 @@ impl<'a> Executor<'a> {
             apply_move_pair_adopts(self.conn, move_pair_adopts, &acknowledged_moves)?;
         // Placement/observations land first. A failed destination rename then
         // leaves the old flag baseline and a destination receipt for recovery.
-        local_flag_updates += self.update_local_flags(move_pair_flags.into_iter().filter(|action| {
+        let move_pair_flags: Vec<_> = move_pair_flags.into_iter().filter(|action| {
             matches!(action, SyncAction::UpdateLocalFlags { id, .. } if acknowledged_moves.contains(&id.jmap_email_id))
-        }).collect())?;
+        }).collect();
+        local_flags_actually_attempted += move_pair_flags.len();
+        local_flag_updates += self.update_local_flags(move_pair_flags)?;
         // DestroyRemoteMailbox runs after every per-email push
         // phase so any cycle-local Upload/Move/Update targeting
         // the soon-to-be-destroyed mailbox lands first. Matches
@@ -281,6 +295,24 @@ impl<'a> Executor<'a> {
         let moved = local_moves_count + remote_counts.moves;
         let deleted = local_deletes_count + remote_counts.destroys;
         let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
+        let blocked_updates: HashSet<_> = outcome
+            .update_rejections
+            .iter()
+            .filter(|(_, failure)| !failure.retryable)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let blocked_destroys: HashSet<_> = outcome
+            .destroy_rejections
+            .iter()
+            .filter(|(_, failure)| !failure.retryable)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let retryable_remote_actions =
+            failed_remote_actions - blocked_updates.len() - blocked_destroys.len();
+        let blocked_remote_ids = blocked_updates
+            .into_iter()
+            .chain(blocked_destroys)
+            .collect();
 
         // RFC 8620 section 7.1 cursor ratchet, combined across every
         // server-state-advancing call we made this cycle (every
@@ -330,9 +362,6 @@ impl<'a> Executor<'a> {
             debug!("Persisted new Email state: {}", state);
         }
 
-        let pending_flag_actions = flag_sync::pending_ids(self.conn, false)?.len();
-        let blocked_flag_actions =
-            pending_flag_actions.saturating_sub(flag_sync::pending_ids(self.conn, true)?.len());
         Ok(SyncOutcome {
             downloaded,
             uploaded,
@@ -340,14 +369,17 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
+            retryable_remote_actions,
+            blocked_remote_ids,
+            retryable_local_actions: local_flags_actually_attempted - local_flag_updates
+                + local_moves_attempted
+                - local_moves_count,
+            retryable_deferred_actions,
+            review_actions: review_actions + remote_counts.deferred,
             deferred_actions: remote_counts.deferred + deferred_flags + deferred_move_pairs,
-            pending_flag_actions,
-            blocked_flag_actions,
-            // Engine sets these from the unfiltered plan / bindings;
-            // executor doesn't have the visibility to compute them.
-            already_in_sync: false,
-            remote_orphans_detected: 0,
-            remote_orphan_total_emails: 0,
+            // Selected history/status and scope authority belong to the engine,
+            // which knows the resolved bindings. Never query the whole DB here.
+            ..Default::default()
         })
     }
 

@@ -450,6 +450,7 @@ fn defer_superseded_move_flags(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
                 .into_iter()
                 .map(|id| SyncAction::DeferredFlagState {
                     id,
+                    retryable: true,
                     reason:
                         "Folder policy superseded the move; replan flags after its counter-move"
                             .into(),
@@ -1210,6 +1211,12 @@ fn emit_resurrect_for(orphan: &LocalOrphanRecord, ctx: &ReconcileCtx<'_>, plan: 
     }
 }
 
+fn retryable_flag_observation(ctx: &ReconcileCtx<'_>, id: &JmapEmailId) -> bool {
+    ctx.flag_sync
+        .get(id)
+        .is_none_or(|state| !state.blocked && !state.review)
+}
+
 fn emit_detected_moves(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mut SyncPlan) {
     for m in moves {
         let record = &ctx.known_by_jmap[&m.jmap_email_id];
@@ -1221,6 +1228,7 @@ fn emit_detected_moves(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mu
             plan.actions.push(SyncAction::DeferredFlagState {
                 id: remote_id,
                 reason: "Moved message's remote metadata could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, &m.jmap_email_id),
             });
             continue;
         }
@@ -1241,6 +1249,7 @@ fn emit_detected_moves(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mu
                 id: remote_id,
                 reason: "Local and remote mailbox destinations conflict; placement needs review"
                     .into(),
+                retryable: false,
             });
             // Keep the membership delta available on a no-new-edit retry.
             plan.new_email_state = None;
@@ -1259,6 +1268,7 @@ fn emit_detected_moves(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mu
                         id: remote_id,
                         reason: "Invalid cached move metadata; fresh verification is required"
                             .into(),
+                        retryable: true,
                     });
                     continue;
                 }
@@ -1752,6 +1762,19 @@ fn emit_adoption_flag_reconciliation(
         .cloned()
         .unwrap_or_default();
     let server_flags = keywords_to_flags(rec.server_keywords);
+    if ctx.retry_only
+        && (initial.blocked || initial.review)
+        && mapped_flags(rec.on_disk_flags) != server_flags
+    {
+        plan.actions.push(SyncAction::DeferredFlagState {
+            id,
+            retryable: false,
+            reason: initial
+                .error
+                .unwrap_or_else(|| "Flag reconciliation needs operator review".into()),
+        });
+        return None;
+    }
     let decision = super::flag_resolution::decide(
         &initial,
         rec.on_disk_flags,
@@ -1775,6 +1798,7 @@ fn emit_adoption_flag_reconciliation(
                 .state
                 .error
                 .unwrap_or_else(|| "Flag history requires review".into()),
+            retryable: false,
         });
         return None;
     };
@@ -1796,6 +1820,7 @@ fn emit_adoption_flag_reconciliation(
             plan.actions.push(SyncAction::DeferredFlagState {
                 id,
                 reason: "Missing identity metadata for adoption flag rename".into(),
+                retryable: true,
             });
         }
     } else if server_flags != target {
@@ -2023,6 +2048,7 @@ fn handle_local_new(
             plan.actions.push(SyncAction::DeferredFlagState {
                 id: bound_id.as_remote(),
                 reason: "Adoption's remote metadata could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, &rec.jmap_email_id),
             });
             return;
         }
@@ -2040,6 +2066,7 @@ fn handle_local_new(
                         id: bound_id.as_remote(),
                         reason: "Invalid cached adoption metadata; fresh verification is required"
                             .into(),
+                        retryable: true,
                     });
                     return;
                 }
@@ -2227,6 +2254,7 @@ fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &
             plan.actions.push(SyncAction::DeferredFlagState {
                 id: remote_id,
                 reason: "Remote flag observation could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, id),
             });
             continue;
         }
@@ -2249,6 +2277,7 @@ fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &
             && !initial.review
             && !initial.blocked
             && initial.attempt.is_none()
+            && initial.error.is_none()
             && initial.baseline.as_ref().is_some_and(|baseline| {
                 baseline == &record.flags && baseline == &mapped_flags(local)
             })
@@ -2269,18 +2298,23 @@ fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &
                 plan.actions.push(SyncAction::DeferredFlagState {
                     id: remote_id,
                     reason: "Invalid cached remote keywords; fresh verification is required".into(),
+                    retryable: true,
                 });
                 continue;
             }
         };
         let remote = fresh.map_or(&cached, |email| &email.keywords);
         let remote_flags = keywords_to_flags(remote);
-        if ctx.retry_only && (initial.blocked || initial.review) {
+        if ctx.retry_only
+            && (initial.blocked || initial.review)
+            && mapped_flags(local) != remote_flags
+        {
             plan.actions.push(SyncAction::DeferredFlagState {
                 id: remote_id,
                 reason: initial
                     .error
                     .unwrap_or_else(|| "Flag reconciliation needs operator review".into()),
+                retryable: false,
             });
             continue;
         }
@@ -2318,6 +2352,7 @@ fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &
                     plan.actions.push(SyncAction::DeferredFlagState {
                         id: remote_id.clone(),
                         reason: "Missing remote identity metadata for local flag update".into(),
+                        retryable: true,
                     });
                 }
             } else if remote_flags != target {
@@ -2356,6 +2391,7 @@ fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &
                     .error
                     .clone()
                     .unwrap_or_else(|| "Flag history requires explicit repair policy".into()),
+                retryable: false,
             });
             plan.actions.push(SyncAction::ObserveMessage {
                 id: BoundId {

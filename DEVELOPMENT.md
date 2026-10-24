@@ -47,10 +47,10 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
   - `folder_checkpoint` -- per-folder `(cur_mtime, new_mtime, cur_count, new_count)` snapshot written at the tail of every successful Full cycle. Phase 0 reads it to skip the dedupe walk for folders whose on-disk state hasn't changed; see [The sync cycle](#the-sync-cycle).
 
   Access goes through `queries.rs` or the narrowly scoped `flag_sync.rs` history API. Keep SQL in the state layer.
-- `src/sync/` -- orchestration (engine, plan, reconcile, execute, plus `self_writes.rs` for the daemon's self-write cache). See [Sync internals](#sync-internals) below.
+- `src/sync/` -- orchestration (engine, plan, reconcile, execute), the shared flag decision in `flag_resolution.rs`, cached selected-history reporting in `status.rs`, and the daemon's self-write cache in `self_writes.rs`. See [Sync internals](#sync-internals) below.
 - `src/janitor/` -- maintenance tasks invokable from the engine's Phase 0 and from `jma janitor <task>` CLI subcommands. Today: `dedupe`, `remotededupe`, `rebindfolders`, `prune` (issue #8). Reserved-but-empty: `db_gc`. Each task is a thin orchestration over the underlying primitive (e.g. `janitor::dedupe::run` wraps `sync::dedupe::plan_dedupe` + `apply_dedupe` with the empty-folder-list short-circuit); `prune` is offline drift remediation built on `maildir_ops::drift` + `removal` (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)).
 - `src/profile.rs` -- per-run profiling layer. Aggregates `tracing` spans and events from the sync engine and maildir ops into a phase-by-phase summary (timings, blob throughput, file-op counts, RSS deltas). Output is opt-in via `--profile` (stderr table) and `--profile-json <PATH>` (NDJSON per cycle in daemon mode).
-- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing; classifies each batch via `classify.rs` before emitting, so noise never enters the channel). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the trigger loop holds open a coalescing window after the first arrival to absorb back-to-back batches, then dispatches one `SyncEngine::run` per coalesced cycle (path-driven scan for `LocalChange`, full scan for everything else). Every trigger that reaches the loop starts a cycle. See [Trigger pipeline](#trigger-pipeline) for the layering. `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
+- `src/daemon/` -- `watch` mode. `runner.rs` owns the FS watcher and long-lived engine, performs the initial full sync, then runs SSE sessions. `eventsource.rs` listens on the JMAP `eventSourceUrl`; `watcher.rs` debounces filesystem notifications and classifies batches via `classify.rs` before emitting. Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s. `retry.rs` owns the independent retained-work deadline and permanent-rejection mask across sessions. The trigger loop dispatches path-driven local cycles, normal full cycles, or full retry cycles. See [Trigger pipeline](#trigger-pipeline). `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
 
 ## Identifiers
 
@@ -221,10 +221,30 @@ old and new mutating binaries against one DB: older binaries do not maintain
 this history. Reset/rebuild still discards it and invokes bootstrap policy;
 this is not a lossless migration or a general durable operation queue.
 
-`pending_flag_actions` and `blocked_flag_actions` keep unfinished work from
-being reported as already synchronized. Retryable pending/legacy rows widen
-Paths scans to Full. Full/manual cycles can replan retained discrepancies;
-there is not yet a daemon-owned retry timer or targeted legacy repair CLI.
+`pending_flag_actions`, `blocked_flag_actions` and `unverified_flag_actions`
+keep unfinished work from being reported as already synchronized, including
+path no-ops and previews. `flag_sync::summarize` and `load_for_mailboxes` are
+scoped to resolved selected bindings (plus managed local orphans), not the
+whole DB. Excluded histories cannot force full scans, pollute counts, or
+break a selected cycle by containing an invalid receipt. Queries normalize
+unowned suffix letters and retain known errors even when old cached views
+agree. Missing history is unverified, not a settled or empty baseline.
+
+Retryable pending/legacy work widens Paths to Full. `SyncOutcome` separates
+retryable remote/local effects and deferred observations from permanent
+remote rejections and explicit review deferrals. An effect withheld by a
+membership or direction gate is not an attempted local failure. The engine
+computes scoped history status; the executor no longer counts the entire DB.
+Console and daemon/TUI reporting show unfinished/blocked work rather than
+claiming idle. `sync/status.rs` supplies SELECT-only cached history queries
+for `jma status`; configured selection uses cached remote paths and warns
+about unclassifiable bound mailboxes. It does not verify remote state or
+acknowledge histories. Existing DB-opening/schema initialization is unchanged.
+
+Full/manual cycles can reassess retained discrepancies. Watch mode also has
+an event-independent retry deadline (see below). Targeted legacy authority
+repair and Email-state preconditions/stateMismatch replanning remain separate
+follow-ups; a timer does not recover discarded DB history.
 Unresolved flag histories hold destructive local-orphan handling, while mere
 metadata observations are not user-change blockers. Moves and adoption use
 the same baseline decision as ordinary updates. A move uses the observed
@@ -548,7 +568,7 @@ Things to avoid:
 
 ### Trigger pipeline
 
-`watch` mode receives change signals from two sources and funnels them into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise; a self-write cache rides alongside layer 1 to suppress fsevents echoes of jma's own disk writes:
+`watch` mode receives external change signals from two sources and funnels them, plus a daemon-owned retained-work deadline, into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise; a self-write cache rides alongside layer 1 to suppress fsevents echoes of jma's own disk writes:
 
 ```
 FS kernel events -> notify-debouncer-mini -> [self-write cache] -> mpsc trigger channel -> coalescing window -> engine.run
@@ -559,11 +579,50 @@ SSE state events ---------------------------------------------------/
 
 **Layer 1: per-path debouncing** (`notify-debouncer-mini`, configured via `[watch].debounce_secs`, default 2s). The crate keeps one global wakeup timer plus a per-path event map. When the timer fires, every path whose `update.elapsed() >= timeout` is drained and emitted in the same batch; surviving paths re-arm a fresh deadline off the youngest survivor. With `batch_mode = true` (the crate default), an arriving event never shortens an existing deadline, so paths batch together against the deadline that was set by the *first* event of the current burst rather than each path setting its own. Practical consequence: a flurry of writes against the same file collapses into one emit; writes against different paths usually emit together but can land in adjacent ticks (see below).
 
-**Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle runs only once the channel is quiet for the full window. This layer also decides the trigger shape via dominance, broadest scan first: `Initial` beats `Manual` beats `RemoteChange` beats `LocalStructuralChange` beats `LocalChange`. `LocalChange` paths concatenate across every absorbed `LocalChange`; a merge landing on `LocalStructuralChange` unions the `candidates` from every absorbed structural trigger and folds every absorbed trigger's message paths -- structural and plain `LocalChange` alike -- into the merged trigger's `message_paths`, so a folder-level event doesn't lose the FS-event paths from the same batch.
+**Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle normally runs once the channel is quiet for the full window, but a due retry caps that wait and a timer-first cycle bypasses coalescing. This layer also decides the trigger shape via dominance, broadest scan first: `Initial` beats `Manual` beats `RemoteChange` beats `LocalStructuralChange` beats `LocalChange`. `LocalChange` paths concatenate across every absorbed `LocalChange`; a merge landing on `LocalStructuralChange` unions the `candidates` from every absorbed structural trigger and folds every absorbed trigger's message paths -- structural and plain `LocalChange` alike -- into the merged trigger's `message_paths`, so a folder-level event doesn't lose the FS-event paths from the same batch.
 
 Before the watcher emits a `LocalStructuralChange` trigger, `daemon::classify::batch_fires` judges the batch's structural candidates on two cheap signals: a candidate fires if it is a `cur`/`new`/`tmp` path event, or if it is a maildir on disk via `store::is_maildir` (a folder that appears by create, rename, or move stats as a maildir, which a rename delivers atomically without trio events; this arm is unguarded, since a renamed folder carries its sentinel with it and gating here would suppress the rename). The trio arm is gated on the folder's `.jma.mapping` sentinel: a missing trio always fires (a folder being torn down), but an intact trio fires only when its parent folder has no sentinel, i.e. jma has not bound it yet. An intact trio under a sentinel'd (already-bound) folder is treated as churn noise rather than a create or teardown -- FSEvents on macOS can coalesce heavy in-`cur/` churn (renames and hardlinks that never leave the folder, as in Gnus/nnmaildir's bookkeeping) up into a directory-level event naming `cur` itself, and without the gate that echo reads as a folder appearing. Everything else -- sidecar files, foreign index directories like `.notmuch/` that churn temp files, junk directory trees, bare `mkdir`s, missing non-trio paths -- is noise. This is accurate rather than precise: no binding lookup and no subtree walk, at the cost of two structural changes that carry neither signal at the candidate path and wait for the next full scan -- a folder moved out of the tree, and a nested tree moved in under a bare (non-maildir) parent. A batch whose candidates are all noise degrades at the watcher to a plain `LocalChange` over its surviving message paths, or to nothing at all, so folder-level filesystem noise never enters the trigger channel and every trigger that reaches the runner starts a cycle.
 
 The two layers exist because they smooth different things. `debounce_secs` smooths each filesystem path's event stream; `coalesce_window_ms` smooths *across* paths and across signal sources (FS + SSE). Neither subsumes the other: layer 1 on its own cannot merge two debouncer batches that fire on adjacent ticks, nor can it merge an FS batch with an SSE state event; layer 2 on its own would see one mpsc send per kernel event and have to dedupe everything that the per-path crate already collapses.
+
+#### Retained-work retries
+
+`daemon/retry.rs::OperationRetry` keeps one Tokio-monotonic deadline on the
+`WatchDaemon`, not on an SSE session. Bootstrap and ordinary cycle outcomes
+arm it for retryable message work. Backoff is 1s, 2s, 4s ... capped at 60s,
+separate from transport reconnect backoff. Exhausted transient startup RPCs
+also arm it, so recovery does not depend on a first external event. A
+transport reconnect retains the deadline and rejection mask. Typed SQLite
+BUSY/LOCKED errors also schedule a fresh cycle without rebuilding the JMAP
+session; constraint/corruption errors are not guessed retryable from their
+text. Other hard cycle errors pause automatic retries until another
+external/manual cycle; hard connect/configuration errors still abort rather
+than spinning.
+
+A timer selects `ScanScope::Retry`: a fresh full managed inventory and
+bidirectional reconciliation, not replay of a serialized stale mutation.
+Retry-only flag decisions skip blocked/review disagreement but can recognize
+fresh agreement. A daemon-lifetime set of confirmed permanent Email/set
+rejections also suppresses mailbox-only updates and destroys, with their
+paired destination bindings/local effects. Suppression holds the Email
+cursor and reports blocked work. Missing positive ACK is ambiguous/retryable,
+not a confirmed permanent rejection. Ordinary event/manual Full cycles may
+reassess permissions; restart performs a normal Full bootstrap. The mask is
+not persisted as a general operation queue.
+
+A path no-op cannot clear or postpone a deadline. For successful outcomes,
+only a completed, non-preview, bidirectional full check may disarm it when
+no retryable work remains. Blocked/review-only work does not arm a timer. If a deadline expires
+during path coalescing, the merged external cycle is promoted to normal Full
+so it neither loses fresh local edits nor consumes a mailbox-only retry as a
+path no-op. A timer-first cycle runs without waiting for a quiet FS stream.
+
+This is retained flag/message-effect recovery, not a new retry guarantee for
+all body imports or mailbox RPCs. Retry cycles retain normal managed-folder
+policy; they are not the targeted flag-only repair command. Tests drive the
+real runner/engine/HTTP model with controlled producers (no accidental FS/SSE
+follow-up), plus paused-clock scheduling tests. Real Stalwart/OS producer
+coverage remains a separate gate.
 
 #### Self-write cache
 

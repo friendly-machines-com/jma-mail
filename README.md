@@ -25,6 +25,11 @@ $ jma
 $ jma watch
 ```
 
+Watch mode retries eligible unfinished message work with bounded backoff even
+without a new server or filesystem event. Permission/review failures remain
+visible as pending or blocked rather than "in sync"; normal event/manual
+cycles can reassess them. `jma status` reports cached selected flag history,
+not a fresh server verification.
 
 ## Installation
 
@@ -266,20 +271,22 @@ On-disk name                                Total   Unread  Role
 
 ```
 
-### status : Sync staleness, cursor health, and maildir drift
+### status : Sync staleness, flag history, cursor health, and maildir drift
 
-`status` is a read-only, offline subcommand for the questions that aren't answered by `mailboxes` (which goes to the server) or by counting files on disk. It opens the state DB without taking any locks, so it's safe to run alongside an in-progress `sync` or `watch`.
+`status` is a read-only, offline subcommand for the questions that aren't answered by `mailboxes` (which goes to the server) or by counting files on disk. It opens the state DB without taking the sync/watch advisory locks, so it can inspect cached state alongside an in-progress `sync` or `watch`; ordinary SQLite locking still applies.
 
 ```console
 $ jma status
 Configured account: foo@example.com
 Maildir root: /Users/foo/Mail
-State DB: /Users/foo/Mail/.jma.db (132.4 KB, schema v1)
+State DB: /Users/foo/Mail/.jma.db (132.4 KB, schema v2)
 
 JMAP cursors (account a1b2c3d4e):
   Last cursor write: 2026-05-06 14:22:01 (12m ago)
   Email cursor: healthy
   Mailbox cursor: healthy
+
+Flag histories (cached selected bindings): 0 pending, 0 blocked/review, 0 unverified
 
 Maildir vs DB drift (under /Users/foo/Mail):
   Folders on disk not in DB: SomeNewFolder
@@ -292,6 +299,7 @@ What each section is for:
 
   * **Last cursor write.** "When did the JMAP cursor for this account last advance?" Answers the staleness question without going online. The semantic is "last cursor write," not "last sync attempt completed" -- a sync run that produces no state change is invisible here, since we don't write a row when there's nothing to write. Reasonable proxy for "is this account stale, should I run sync?" but not a sync-attempt log.
   * **Cursor health.** Each tracked entity (`Email`, `Mailbox`) is either `healthy` (a state cookie is set) or `FORCED RESYNC`. The latter means the cursor was tripped by a `cannotCalculateChanges` error from the server, and the next mutating run (`sync`/`pull`/`watch`) will do a full re-pull instead of a delta. Surfaced here so a slow next cycle isn't a surprise.
+  * **Flag histories.** Pending generations have unfinished flag work; blocked/review generations need permission repair or explicit reassessment; unverified messages have no acknowledged history yet. Counts follow `[sync].mailboxes` using cached remote paths, with a warning when missing paths prevent classification. These are cached flag counts, not proof that all mailbox placement or remote state is synchronized. `status` does not acknowledge or repair them.
   * **Maildir vs DB drift.** Four classes of disagreement between the maildir tree and `mailbox_map`: folders on disk with no DB row ("I `mkdir`'d a folder, why hasn't jma noticed"), DB rows with no folder on disk ("the DB thinks I have a folder I don't"), folders still on both sides but no longer selected by `[sync].mailboxes` (you shrank the sync set), and local renames not yet pushed to the server. `status` only reports these; `janitor prune` is the command that clears them.
   * **DB metadata.** Path, size, and schema version of the state DB. Useful for bug reports and for noticing when the DB has gotten unexpectedly large.
 

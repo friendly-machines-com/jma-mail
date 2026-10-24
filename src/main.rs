@@ -428,6 +428,12 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     print_account_cursors(&conn)?;
 
     println!();
+    println!(
+        "{}",
+        jma_mail::sync::status::cached_flag_status(&conn, &config.sync)?
+    );
+
+    println!();
     print_maildir_drift(&conn, &config)?;
 
     Ok(())

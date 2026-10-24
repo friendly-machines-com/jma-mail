@@ -34,8 +34,12 @@ struct ServerState {
     blobs: HashMap<String, Vec<u8>>,
     set_requests: Vec<Value>,
     blob_requests: usize,
+    email_changes_requests: usize,
+    email_changes_failures: usize,
     reject_next_update: usize,
     reject_only_id: Option<String>,
+    reject_update_type: Option<String>,
+    reject_updates: HashMap<String, (usize, String)>,
     http_failures: usize,
     lost_replies: usize,
     omitted_acknowledgements: usize,
@@ -525,6 +529,11 @@ fn email_get(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
 }
 
 fn email_changes(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
+    state.email_changes_requests += 1;
+    if state.email_changes_failures > 0 {
+        state.email_changes_failures -= 1;
+        return json!(["error", {"type":"serverFail", "description":"injected changes outage"}, call_id]);
+    }
     if let Some(err) = state.next_email_changes_error.take() {
         return json!([
             "error",
@@ -1614,6 +1623,646 @@ async fn flag_matrix_ordinary_pull_rename_failure_survives_reopen() {
     assert!(fixture.sync().await.unwrap().already_in_sync);
 }
 
+fn seed_excluded_flag_history(fixture: &FlagFixture, legacy: bool) {
+    queries::upsert_message(
+        &fixture.conn,
+        &queries::MessageRecord {
+            jmap_email_id: "E2".into(),
+            jmap_blob_id: Some("B2".into()),
+            jmap_thread_id: Some("T2".into()),
+            jmap_mailbox_id: "MB-TRASH".into(),
+            maildir_id: Some("excluded".into()),
+            message_id: "excluded@example.com".into(),
+            flags: "FS".into(),
+            jmap_keywords: serde_json::to_string(&flags_to_keywords("FS")).unwrap(),
+        },
+    )
+    .unwrap();
+    queries::upsert_local_state(
+        &fixture.conn,
+        &"excluded".into(),
+        "Deleted Items",
+        "S",
+        None,
+    )
+    .unwrap();
+    if !legacy {
+        crate::state::flag_sync::acknowledge(&fixture.conn, &"E2".into(), "FS").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn flag_retry_excluded_histories_do_not_widen_paths_or_pollute_status() {
+    use crate::sync::engine::ScanScope;
+    use crate::sync::plan::SyncDirection;
+    for legacy in [false, true] {
+        let mut fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+        seed_excluded_flag_history(&fixture, legacy);
+        fixture.config.sync.mailboxes = vec!["INBOX".into()];
+        let before = fixture.state.lock().unwrap().email_changes_requests;
+        let result = SyncEngine::connect(&fixture.conn, &fixture.config)
+            .await
+            .unwrap()
+            .run(
+                false,
+                SyncDirection::Both,
+                ScanScope::Paths(vec![fixture.file()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.state.lock().unwrap().email_changes_requests,
+            before,
+            "excluded pending/legacy bindings must not force a full scan"
+        );
+        assert!(result.already_in_sync, "{result:?}");
+        assert_eq!(
+            (result.pending_flag_actions, result.blocked_flag_actions),
+            (0, 0)
+        );
+        let full = fixture.sync().await.unwrap();
+        assert!(full.already_in_sync, "{full:?}");
+        assert_eq!(
+            (full.pending_flag_actions, full.blocked_flag_actions),
+            (0, 0)
+        );
+        assert_converged(&fixture, "S").await;
+    }
+}
+
+#[tokio::test]
+async fn flag_retry_excluded_invalid_receipt_does_not_break_selected_sync() {
+    let mut fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+    seed_excluded_flag_history(&fixture, false);
+    fixture
+        .conn
+        .execute(
+            "UPDATE message_flag_sync SET attempt='invalid' WHERE jmap_email_id='E2'",
+            [],
+        )
+        .unwrap();
+    fixture.config.sync.mailboxes = vec!["INBOX".into()];
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+    assert!(
+        crate::state::flag_sync::get(&fixture.conn, &"E2".into()).is_err(),
+        "excluded corruption is retained, not erased or treated as acknowledgement"
+    );
+}
+
+#[tokio::test]
+async fn flag_retry_blocked_paths_noop_still_reports_unfinished_history() {
+    use crate::sync::engine::ScanScope;
+    use crate::sync::plan::SyncDirection;
+    let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("S", false, false);
+    fixture.state.lock().unwrap().reject_next_update = 1;
+    assert_eq!(fixture.sync().await.unwrap().failed_remote_actions, 1);
+    let before = fixture.state.lock().unwrap().email_changes_requests;
+    let result = SyncEngine::connect(&fixture.conn, &fixture.config)
+        .await
+        .unwrap()
+        .run(
+            false,
+            SyncDirection::Both,
+            ScanScope::Paths(vec![fixture.file()]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !result.already_in_sync,
+        "a blocked generation is not an idle synchronized state"
+    );
+    assert_eq!(
+        (result.pending_flag_actions, result.blocked_flag_actions),
+        (1, 1)
+    );
+    assert_eq!(
+        fixture.state.lock().unwrap().email_changes_requests,
+        before,
+        "report blocked work without fetching or hammering its rejected mutation"
+    );
+    assert_eq!(fixture.state.lock().unwrap().set_requests.len(), 1);
+}
+
+#[tokio::test]
+async fn flag_retry_preview_reports_history_without_mutating_it() {
+    let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("S", false, false);
+    fixture.state.lock().unwrap().reject_next_update = 1;
+    fixture.sync().await.unwrap();
+    let before = fixture.snapshot().await;
+    let preview = SyncEngine::sync(&fixture.conn, &fixture.config, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        (preview.pending_flag_actions, preview.blocked_flag_actions),
+        (1, 1)
+    );
+    assert!(!preview.already_in_sync);
+    assert_eq!(fixture.snapshot().await, before);
+}
+
+async fn next_watch_cycle(
+    cycles: &mut tokio::sync::mpsc::UnboundedReceiver<
+        Result<crate::sync::engine::SyncOutcome, String>,
+    >,
+) -> crate::sync::engine::SyncOutcome {
+    tokio::time::timeout(std::time::Duration::from_secs(15), cycles.recv())
+        .await
+        .expect("daemon must complete a cycle without another external event")
+        .expect("cycle observer must remain open")
+        .expect("cycle must reach a protocol outcome")
+}
+
+async fn daemon_eventless_flag_retry(startup: bool) {
+    use crate::daemon::runner::{SyncTrigger, run_controlled};
+    let mut fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    fixture.config.watch.coalesce_window_ms = if startup { 30_000 } else { 0 };
+    if startup {
+        fixture.local_change("S", false, false);
+        let mut state = fixture.state.lock().unwrap();
+        state.reject_next_update = 1;
+        state.reject_update_type = Some("rateLimit".into());
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let daemon = run_controlled(
+        &fixture.conn,
+        &fixture.config,
+        (tx.clone(), rx),
+        cycles_tx,
+        Arc::clone(&stop),
+    );
+    let driver = async {
+        if !startup {
+            assert!(next_watch_cycle(&mut cycles_rx).await.already_in_sync);
+            fixture.local_change("S", false, false);
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.reject_next_update = 1;
+                state.reject_update_type = Some("rateLimit".into());
+            }
+            tx.send(SyncTrigger::LocalChange(vec![fixture.file()]))
+                .await
+                .unwrap();
+        }
+        let rejected = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(rejected.failed_remote_actions, 1);
+        assert_eq!(
+            (rejected.pending_flag_actions, rejected.blocked_flag_actions),
+            (1, 0)
+        );
+        // Controlled producers send nothing after the failed cycle. Only the
+        // runner's own deadline can produce this next real SyncEngine cycle.
+        let repaired = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(repaired.flag_updates, 1);
+        assert_eq!(repaired.pending_flag_actions, 0);
+        assert_converged(&fixture, "S").await;
+        assert_eq!(fixture.state.lock().unwrap().set_requests.len(), 2);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(2200), cycles_rx.recv())
+                .await
+                .is_err(),
+            "successful repair must disarm its retry deadline"
+        );
+        stop.notify_one();
+    };
+    let (finished, ()) = tokio::join!(daemon, driver);
+    finished.unwrap();
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+    assert_converged(&fixture, "S").await;
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_startup_rejection_retries_without_an_event() {
+    daemon_eventless_flag_retry(true).await;
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_normal_cycle_rejection_retries_without_an_event() {
+    daemon_eventless_flag_retry(false).await;
+}
+
+#[tokio::test]
+async fn flag_retry_cached_status_respects_selection_and_reports_unknown_paths() {
+    use crate::sync::status::cached_flag_status;
+    let mut fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+    seed_excluded_flag_history(&fixture, false);
+    crate::state::flag_sync::failure(&fixture.conn, &"E2".into(), true, true, "forbidden").unwrap();
+    fixture.config.sync.mailboxes = vec!["INBOX".into()];
+    assert!(
+        cached_flag_status(&fixture.conn, &fixture.config.sync)
+            .unwrap()
+            .flags
+            .pending
+            .is_empty()
+    );
+    fixture.config.sync.mailboxes.clear();
+    let all = cached_flag_status(&fixture.conn, &fixture.config.sync).unwrap();
+    assert_eq!((all.flags.pending.len(), all.flags.blocked.len()), (1, 1));
+    assert!(all.to_string().contains("1 pending, 1 blocked/review"));
+    fixture.config.sync.mailboxes = vec!["Deleted Items".into()];
+    fixture
+        .conn
+        .execute(
+            "UPDATE mailbox_map SET remote_path=NULL WHERE jmap_mailbox_id='MB-TRASH'",
+            [],
+        )
+        .unwrap();
+    fixture
+        .conn
+        .pragma_update(None, "query_only", true)
+        .unwrap();
+    let unknown = cached_flag_status(&fixture.conn, &fixture.config.sync).unwrap();
+    assert_eq!(unknown.unclassified_mailboxes, 1);
+    assert!(unknown.to_string().contains("could not be classified"));
+    assert!(
+        crate::state::flag_sync::get(&fixture.conn, &"E2".into())
+            .unwrap()
+            .unwrap()
+            .blocked
+    );
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_does_not_schedule_permission_or_review_only_work() {
+    use crate::daemon::runner::{SyncTrigger, run_controlled};
+    for review in [false, true] {
+        let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+        fixture.config.watch.coalesce_window_ms = 0;
+        fixture.local_change("S", false, false);
+        if review {
+            fixture.server_change("F", true);
+            let mut history = crate::state::flag_sync::get(&fixture.conn, &"E1".into())
+                .unwrap()
+                .unwrap();
+            history.review = true;
+            crate::state::flag_sync::store(&fixture.conn, &"E1".into(), &history).unwrap();
+        } else {
+            fixture.state.lock().unwrap().reject_next_update = 1;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let daemon = run_controlled(
+            &fixture.conn,
+            &fixture.config,
+            (tx.clone(), rx),
+            cycles_tx,
+            Arc::clone(&stop),
+        );
+        let driver = async {
+            let blocked = next_watch_cycle(&mut cycles_rx).await;
+            assert_eq!(
+                (blocked.pending_flag_actions, blocked.blocked_flag_actions),
+                (1, 1)
+            );
+            assert!(!blocked.needs_retry());
+            assert!(!blocked.already_in_sync);
+            assert_eq!(blocked.flag_updates, 0);
+            let snapshot = fixture.snapshot().await;
+            assert_eq!(snapshot["file_flags"], "S");
+            assert_eq!(snapshot["acknowledged_flags"], "");
+            assert_eq!(snapshot["server_flags"], if review { "F" } else { "" });
+            let requests = fixture.state.lock().unwrap().set_requests.len();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(2200), cycles_rx.recv())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.state.lock().unwrap().set_requests.len(), requests);
+            if !review {
+                // Explicit reassessment is allowed after permission repair,
+                // without inventing a new flag edit or resetting the DB.
+                tx.send(SyncTrigger::Manual).await.unwrap();
+                assert_eq!(next_watch_cycle(&mut cycles_rx).await.flag_updates, 1);
+                assert_converged(&fixture, "S").await;
+            }
+            stop.notify_one();
+        };
+        let (finished, ()) = tokio::join!(daemon, driver);
+        finished.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_transport_outages_recover_without_an_event() {
+    use crate::daemon::runner::run_controlled;
+    for after_rejection in [false, true] {
+        let mut fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+        fixture.config.watch.coalesce_window_ms = 0;
+        fixture.local_change("S", false, false);
+        let attempts = crate::jmap::retry::RetryConfig::default().max_attempts as usize;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            if after_rejection {
+                state.reject_next_update = 1;
+                state.reject_update_type = Some("rateLimit".into());
+            } else {
+                state.email_changes_failures = attempts;
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let daemon = run_controlled(
+            &fixture.conn,
+            &fixture.config,
+            (tx, rx),
+            cycles_tx,
+            Arc::clone(&stop),
+        );
+        let driver = async {
+            if after_rejection {
+                assert_eq!(
+                    next_watch_cycle(&mut cycles_rx).await.failed_remote_actions,
+                    1
+                );
+                fixture.state.lock().unwrap().email_changes_failures = attempts;
+            }
+            let outage = tokio::time::timeout(std::time::Duration::from_secs(20), cycles_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                outage.is_err(),
+                "the injected outage must exhaust RPC retries"
+            );
+            assert_eq!(fixture.state.lock().unwrap().email_changes_failures, 0);
+            let repaired = next_watch_cycle(&mut cycles_rx).await;
+            assert_eq!(repaired.flag_updates, 1);
+            assert_eq!(repaired.pending_flag_actions, 0);
+            assert_converged(&fixture, "S").await;
+            stop.notify_one();
+        };
+        let (finished, ()) = tokio::join!(daemon, driver);
+        finished.unwrap();
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+    }
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_deadline_caps_unrelated_path_coalescing() {
+    use crate::daemon::runner::{SyncTrigger, run_controlled};
+    let mut fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+    fixture.config.watch.coalesce_window_ms = 30_000;
+    fixture.local_change("S", true, false);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.reject_next_update = 1;
+        state.reject_update_type = Some("rateLimit".into());
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let daemon = run_controlled(
+        &fixture.conn,
+        &fixture.config,
+        (tx.clone(), rx),
+        cycles_tx,
+        Arc::clone(&stop),
+    );
+    let driver = async {
+        let rejected = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(rejected.retryable_remote_actions, 1);
+        assert_eq!(
+            rejected.pending_flag_actions, 0,
+            "this retry cannot rely on flag-DB pending rows"
+        );
+        tx.send(SyncTrigger::LocalChange(vec![
+            fixture.temp.path().join("INBOX/cur/unrelated:2,"),
+        ]))
+        .await
+        .unwrap();
+        let repaired = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(
+            repaired.moved, 1,
+            "a path no-op cannot consume a due full-placement retry"
+        );
+        assert!(!repaired.needs_retry());
+        assert_eq!(fixture.state.lock().unwrap().set_requests.len(), 2);
+        stop.notify_one();
+    };
+    let (finished, ()) = tokio::join!(daemon, driver);
+    finished.unwrap();
+    assert_moved_then_idle(&fixture, "S").await;
+}
+
+#[tokio::test]
+async fn flag_retry_mixed_keyword_retry_does_not_hammer_a_rejected_membership() {
+    use crate::daemon::runner::{SyncTrigger, run_controlled};
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.config.watch.coalesce_window_ms = 0;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.emails.push(RemoteEmail {
+            id: "E2".into(),
+            blob_id: "B2".into(),
+            thread_id: "T2".into(),
+            mailbox_ids: vec!["MB-INBOX".into()],
+            keywords: vec!["keep-two".into()],
+            message_id: Some("second@example.com".into()),
+        });
+        state.blobs.insert(
+            "B2".into(),
+            b"Message-ID: <second@example.com>\r\n\r\nbody\r\n".to_vec(),
+        );
+        advance_email_state(&mut state);
+    }
+    assert_eq!(fixture.sync().await.unwrap().downloaded, 1);
+    for email_id in ["E1", "E2"] {
+        let record = queries::get_message_by_jmap_id(&fixture.conn, &email_id.into())
+            .unwrap()
+            .unwrap();
+        let id = record.maildir_id.unwrap();
+        let source = fixture
+            .temp
+            .path()
+            .join("INBOX/new")
+            .join(format!("{id}:2,"));
+        let target = fixture
+            .temp
+            .path()
+            .join(if email_id == "E1" {
+                "INBOX/cur"
+            } else {
+                "Deleted Items/cur"
+            })
+            .join(format!(
+                "{id}:2,{}",
+                if email_id == "E1" { "S" } else { "SX" }
+            ));
+        std::fs::rename(source, target).unwrap();
+    }
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state
+            .reject_updates
+            .insert("E1".into(), (2, "rateLimit".into()));
+        state
+            .reject_updates
+            .insert("E2".into(), (100, "forbidden".into()));
+        state.emails[1].keywords.push("$flagged".into());
+        advance_email_state(&mut state);
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let daemon = run_controlled(
+        &fixture.conn,
+        &fixture.config,
+        (tx.clone(), rx),
+        cycles_tx,
+        Arc::clone(&stop),
+    );
+    let driver = async {
+        let first = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(first.failed_remote_actions, 2);
+        assert_eq!(first.retryable_remote_actions, 1);
+        assert_eq!(
+            first.retryable_local_actions, 0,
+            "a gated pull was never attempted"
+        );
+        assert!(first.blocked_remote_ids.contains("E2"));
+        let second = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(second.failed_remote_actions, 1);
+        assert_eq!(second.retryable_remote_actions, 1);
+        assert!(second.blocked_remote_ids.contains("E2"));
+        let repaired = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(repaired.flag_updates, 1);
+        assert!(
+            !repaired.needs_retry(),
+            "only the blocked membership remains"
+        );
+        assert!(repaired.blocked_remote_ids.contains("E2"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(4200), cycles_rx.recv())
+                .await
+                .is_err()
+        );
+        {
+            let state = fixture.state.lock().unwrap();
+            for (id, expected) in [("E1", 3), ("E2", 1)] {
+                let requests = state
+                    .set_requests
+                    .iter()
+                    .filter(|request| {
+                        request["methodCalls"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|call| {
+                                call[0] == "Email/set" && call[1]["update"].get(id).is_some()
+                            })
+                    })
+                    .count();
+                assert_eq!(requests, expected, "{id} must have no hidden extra retries");
+            }
+            assert_eq!(state.blob_requests, 2);
+        }
+        let remote = crate::jmap::email::get_by_ids(&fixture.verifier, &["E1".into(), "E2".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            keywords_to_flags(
+                &remote
+                    .iter()
+                    .find(|email| email.id.as_ref() == "E1")
+                    .unwrap()
+                    .keywords
+            ),
+            "S"
+        );
+        assert!(
+            remote
+                .iter()
+                .find(|email| email.id.as_ref() == "E2")
+                .unwrap()
+                .mailbox_ids
+                .contains_key("MB-INBOX")
+        );
+        let record = queries::get_message_by_jmap_id(&fixture.conn, &"E2".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.jmap_mailbox_id.as_ref(), "MB-INBOX");
+        let e2_id = record.maildir_id.unwrap();
+        let destination = fixture.temp.path().join("Deleted Items/cur");
+        assert!(
+            destination.join(format!("{e2_id}:2,SX")).exists(),
+            "blocked membership did not authorize its paired pull"
+        );
+        assert_eq!(
+            crate::state::flag_sync::get(&fixture.conn, &"E2".into())
+                .unwrap()
+                .unwrap()
+                .baseline
+                .as_deref(),
+            Some("")
+        );
+        fixture.state.lock().unwrap().reject_updates.remove("E2");
+        tx.send(SyncTrigger::Manual).await.unwrap();
+        let manual = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(manual.moved, 1);
+        assert_eq!(manual.flag_updates, 1);
+        assert!(manual.blocked_remote_ids.is_empty());
+        assert!(destination.join(format!("{e2_id}:2,FX")).exists());
+        let history = crate::state::flag_sync::get(&fixture.conn, &"E2".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.baseline.as_deref(), Some("F"));
+        assert!(history.attempt.is_none());
+        let remote = crate::jmap::email::get_by_ids(&fixture.verifier, &["E2".into()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(remote.mailbox_ids.contains_key("MB-TRASH"));
+        assert_eq!(remote.keywords.get("keep-two"), Some(&true));
+        stop.notify_one();
+    };
+    let (finished, ()) = tokio::join!(daemon, driver);
+    finished.unwrap();
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+#[tokio::test]
+async fn flag_retry_daemon_busy_state_db_retries_without_an_event() {
+    use crate::daemon::runner::run_controlled;
+    let mut fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    fixture.config.watch.coalesce_window_ms = 0;
+    fixture.local_change("S", false, false);
+    let writer = db::open_or_recreate(std::path::Path::new(fixture.conn.path().unwrap())).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (cycles_tx, mut cycles_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let daemon = run_controlled(
+        &fixture.conn,
+        &fixture.config,
+        (tx, rx),
+        cycles_tx,
+        Arc::clone(&stop),
+    );
+    let driver = async {
+        let busy = tokio::time::timeout(std::time::Duration::from_secs(20), cycles_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            busy.is_err(),
+            "the competing writer must prevent the first cycle from committing"
+        );
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let repaired = next_watch_cycle(&mut cycles_rx).await;
+        assert_eq!(repaired.flag_updates, 1);
+        assert_converged(&fixture, "S").await;
+        stop.notify_one();
+    };
+    let (finished, ()) = tokio::join!(daemon, driver);
+    finished.unwrap();
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
 async fn assert_moved(fixture: &FlagFixture, raw_flags: &str) {
     let snapshot = fixture.snapshot().await;
     let mapped = crate::state::flag_sync::mapped_flags(raw_flags);
@@ -1811,11 +2460,21 @@ fn email_set(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
     let mut not_updated = serde_json::Map::new();
     if let Some(updates) = args["update"].as_object() {
         for (id, patch) in updates {
+            if let Some((remaining, error)) = state.reject_updates.get_mut(id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                not_updated.insert(id.clone(), json!({"type":error}));
+                continue;
+            }
             if state.reject_next_update > 0
                 && state.reject_only_id.as_ref().is_none_or(|only| only == id)
             {
                 state.reject_next_update -= 1;
-                not_updated.insert(id.clone(), json!({"type":"forbidden"}));
+                not_updated.insert(
+                    id.clone(),
+                    json!({"type":state.reject_update_type.as_deref().unwrap_or("forbidden")}),
+                );
                 continue;
             }
             let Some(index) = state.emails.iter().position(|email| &email.id == id) else {

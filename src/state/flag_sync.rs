@@ -7,9 +7,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ids::{JmapEmailId, MaildirId};
+use crate::ids::{JmapEmailId, JmapMailboxId, MaildirId};
 use crate::maildir_ops::flags::{flags_to_keywords, keywords_to_flags};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +80,120 @@ pub fn load(conn: &Connection) -> Result<HashMap<JmapEmailId, FlagSyncState>> {
     rows.map(|row| decode(row?)).collect()
 }
 
+/// Load only managed bindings. An excluded account/folder's history (including
+/// a corrupt receipt) must not affect reconciliation of the selected scope.
+pub fn load_for_mailboxes(
+    conn: &Connection,
+    mailbox_ids: &[JmapMailboxId],
+) -> Result<HashMap<JmapEmailId, FlagSyncState>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.jmap_email_id,f.baseline,f.review,f.attempt,f.blocked,f.error
+        FROM message_map m JOIN message_flag_sync f ON f.jmap_email_id=m.jmap_email_id
+        WHERE m.jmap_mailbox_id=?1",
+    )?;
+    let mut states = HashMap::new();
+    let mut seen = HashSet::new();
+    for mailbox in mailbox_ids.iter().filter(|id| seen.insert(*id)) {
+        let rows = stmt.query_map([mailbox], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, state) = decode(row?)?;
+            states.insert(id, state);
+        }
+    }
+    Ok(states)
+}
+
+#[derive(Debug, Default)]
+pub struct FlagPending {
+    pub pending: Vec<JmapEmailId>,
+    pub blocked: Vec<JmapEmailId>,
+    pub unverified: Vec<JmapEmailId>,
+}
+
+impl FlagPending {
+    pub fn retryable(&self) -> usize {
+        self.pending.len() - self.blocked.len()
+    }
+}
+
+struct PendingRow {
+    id: JmapEmailId,
+    has_history: bool,
+    baseline: Option<String>,
+    review: bool,
+    attempt: Option<String>,
+    blocked: bool,
+    error: bool,
+    remote: String,
+    local: Option<String>,
+}
+
+/// Read-only, indexed per-mailbox pending status. Missing history remains
+/// unverified, not settled; raw suffix extensions alone are not pending work.
+pub fn summarize(conn: &Connection, mailbox_ids: &[JmapMailboxId]) -> Result<FlagPending> {
+    let mut stmt = conn.prepare(
+        "SELECT m.jmap_email_id,f.jmap_email_id IS NOT NULL,f.baseline,
+        COALESCE(f.review,0),f.attempt,COALESCE(f.blocked,0),f.error IS NOT NULL,m.flags,l.flags
+        FROM message_map m LEFT JOIN message_flag_sync f ON f.jmap_email_id=m.jmap_email_id
+        LEFT JOIN local_state l ON l.maildir_id=m.maildir_id
+        WHERE m.jmap_mailbox_id=?1 AND m.maildir_id IS NOT NULL AND
+        (f.jmap_email_id IS NULL OR f.baseline IS NULL OR f.attempt IS NOT NULL
+         OR f.review!=0 OR f.blocked!=0 OR f.error IS NOT NULL OR l.flags IS NULL
+         OR f.baseline!=m.flags OR f.baseline!=l.flags)",
+    )?;
+    let mut status = FlagPending::default();
+    let mut seen = HashSet::new();
+    for mailbox in mailbox_ids.iter().filter(|id| seen.insert(*id)) {
+        let rows = stmt.query_map([mailbox], |row| {
+            Ok(PendingRow {
+                id: row.get(0)?,
+                has_history: row.get(1)?,
+                baseline: row.get(2)?,
+                review: row.get(3)?,
+                attempt: row.get(4)?,
+                blocked: row.get(5)?,
+                error: row.get(6)?,
+                remote: row.get(7)?,
+                local: row.get(8)?,
+            })
+        })?;
+        for row in rows {
+            let row = row?;
+            if !row.has_history {
+                status.unverified.push(row.id);
+                continue;
+            }
+            let unresolved = row.baseline.as_ref().is_none_or(|baseline| {
+                mapped_flags(&row.remote) != *baseline
+                    || row
+                        .local
+                        .as_ref()
+                        .is_none_or(|local| mapped_flags(local) != *baseline)
+            });
+            if row.review || row.blocked || row.error || row.attempt.is_some() || unresolved {
+                let invalid_receipt = row
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|json| serde_json::from_str::<FlagAttempt>(json).is_err());
+                if row.review || row.blocked || invalid_receipt {
+                    status.blocked.push(row.id.clone());
+                }
+                status.pending.push(row.id);
+            }
+        }
+    }
+    Ok(status)
+}
+
 pub fn get(conn: &Connection, id: &JmapEmailId) -> Result<Option<FlagSyncState>> {
     let row: Option<StoredRow> = conn.query_row(
         "SELECT jmap_email_id, baseline, review, attempt, blocked, error FROM message_flag_sync WHERE jmap_email_id=?1",
@@ -142,38 +256,26 @@ pub fn failure(
     store(conn, id, &state)
 }
 
+/// Mailbox IDs with bound messages, including retained orphan bindings which
+/// no longer have a mailbox_map row. Selection belongs to the caller.
+pub fn bound_mailbox_ids(conn: &Connection) -> Result<Vec<JmapMailboxId>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT jmap_mailbox_id FROM message_map WHERE maildir_id IS NOT NULL")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Store-wide compatibility query. Runtime reconciliation uses summarize with
+/// its resolved selected mailbox IDs instead of this global view.
 pub fn pending_ids(conn: &Connection, retryable_only: bool) -> Result<Vec<JmapEmailId>> {
-    let mut stmt = conn.prepare("SELECT f.jmap_email_id,f.baseline,f.review,f.attempt,f.blocked,m.flags,l.flags
-        FROM message_flag_sync f JOIN message_map m ON m.jmap_email_id=f.jmap_email_id
-        LEFT JOIN local_state l ON l.maildir_id=m.maildir_id
-        WHERE m.maildir_id IS NOT NULL AND (f.baseline IS NULL OR f.attempt IS NOT NULL OR f.review!=0
-            OR l.flags IS NULL OR f.baseline!=m.flags OR f.baseline!=l.flags)
-        AND (?1=0 OR (f.review=0 AND f.blocked=0))")?;
-    let rows = stmt.query_map([retryable_only], |row| {
-        Ok((
-            row.get::<_, JmapEmailId>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, bool>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, bool>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?,
-        ))
-    })?;
-    let mut pending = Vec::new();
-    for row in rows {
-        let (id, baseline, review, attempt, _blocked, remote, local) = row?;
-        let unresolved = baseline.as_ref().is_none_or(|baseline| {
-            baseline != &mapped_flags(&remote)
-                || local
-                    .as_ref()
-                    .is_none_or(|flags| mapped_flags(flags) != *baseline)
-        });
-        if review || attempt.is_some() || unresolved {
-            pending.push(id);
-        }
-    }
-    Ok(pending)
+    let status = summarize(conn, &bound_mailbox_ids(conn)?)?;
+    let blocked: HashSet<_> = status.blocked.into_iter().collect();
+    Ok(status
+        .pending
+        .into_iter()
+        .filter(|id| !retryable_only || !blocked.contains(id))
+        .collect())
 }
 
 pub fn has_unverified(conn: &Connection) -> Result<bool> {
@@ -247,6 +349,68 @@ mod tests {
         assert!(state.attempt.is_none() && state.blocked);
         assert_eq!(pending_ids(&conn, false).unwrap().len(), 1);
         assert!(pending_ids(&conn, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_summary_separates_history_and_is_read_only() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn);
+        let scope = [JmapMailboxId::from("MB1")];
+        assert_eq!(
+            summarize(&conn, &scope).unwrap().unverified,
+            vec![JmapEmailId::from("E1")]
+        );
+        assert!(summarize(&conn, &[]).unwrap().unverified.is_empty());
+        assert!(
+            summarize(&conn, &["excluded".into()])
+                .unwrap()
+                .unverified
+                .is_empty()
+        );
+        acknowledge(&conn, &"E1".into(), "S").unwrap();
+        assert!(
+            summarize(&conn, &scope).unwrap().pending.is_empty(),
+            "unowned X is not pending"
+        );
+        failure(&conn, &"E1".into(), true, true, "forbidden").unwrap();
+        let before: u64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        conn.pragma_update(None, "query_only", true).unwrap();
+        let status = summarize(&conn, &scope).unwrap();
+        assert_eq!(status.pending, vec![JmapEmailId::from("E1")]);
+        assert_eq!(status.blocked, status.pending);
+        assert_eq!(
+            status.retryable(),
+            0,
+            "cached agreement cannot erase an unfinished rejected generation"
+        );
+        assert_eq!(load_for_mailboxes(&conn, &scope).unwrap().len(), 1);
+        let after: u64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn scoped_history_does_not_decode_unselected_corrupt_receipts() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn);
+        prepare_attempt(&conn, &"E1".into(), attempt()).unwrap();
+        conn.execute("UPDATE message_flag_sync SET attempt='invalid'", [])
+            .unwrap();
+        assert!(
+            load_for_mailboxes(&conn, &["excluded".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_for_mailboxes(&conn, &["MB1".into()]).is_err());
+        let status = summarize(&conn, &["MB1".into()]).unwrap();
+        assert_eq!(
+            status.blocked.len(),
+            1,
+            "a corrupt receipt needs review, not transport retry"
+        );
     }
 
     #[test]
