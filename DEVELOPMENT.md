@@ -203,6 +203,24 @@ turn another ID's confirmed rejection into an ambiguous receipt. Typed
 permanent rejections are marked blocked, distinct from retryable rejections
 and ambiguous outcomes.
 
+An unacknowledged pull can also have renamed successfully before its ACK
+transaction failed. If the filename now matches that old pull target but fresh
+remote flags differ, the old suffix must not be pushed back as an invented MUA
+edit. When normal resolution would do that (including a server return to the
+old baseline), the shared resolver retains the baseline/receipt and marks
+explicit review. Current values cannot distinguish our rename from a
+coincident local edit, so `repair-flags` supplies the missing authority. This
+is not virtual pull acknowledgement: safe fresh pulls and distinct newer local
+mapped edits still proceed normally, and fresh agreement can still initialize
+a common baseline. Preparing a replacement pull from an older unacknowledged
+pull target marks review before overwriting its receipt; positive ACK clears
+it. If that replacement also fails or is interrupted, review preserves the
+older own-effect ambiguity instead of permitting a later repush when the
+server returns to the baseline. Review keeps its explanatory error instead of
+being relabeled as a legacy-only failure on the next cycle. Stateful SAME-DB tests in
+`flag_tests/pull_ack.rs` cover both unsafe pushes and automatic safe-pull
+recovery, followed by independent fresh verification and later idle cycles.
+
 `store::set_flags_if_unchanged` requires a unique live path and the planner's
 exact raw suffix, refuses existing targets, and syncs renamed directories on
 Unix. A stale plan cannot deliberately find the latest suffix and overwrite

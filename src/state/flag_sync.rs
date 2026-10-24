@@ -232,6 +232,18 @@ pub fn prepare_attempt(conn: &Connection, id: &JmapEmailId, attempt: FlagAttempt
     // A missing row has no acknowledged generation. In particular a cold
     // adoption's observed server flags are not a baseline hint.
     let mut state = get(conn, id)?.unwrap_or_default();
+    // A safe fresh pull may start from an older unacknowledged pull's target.
+    // Replacing its receipt must not turn that suffix into independent MUA
+    // intent if this new effect also fails or the process stops before ACK.
+    // Success clears review in acknowledge; otherwise retain explicit review.
+    if state.attempt.as_ref().is_some_and(|previous| {
+        let source = mapped_flags(&attempt.source_flags);
+        mapped_flags(&previous.source_flags) != previous.target_flags
+            && source == previous.target_flags
+            && source != attempt.target_flags
+    }) {
+        state.review = true;
+    }
     state.attempt = Some(attempt);
     state.blocked = false;
     state.error = None;

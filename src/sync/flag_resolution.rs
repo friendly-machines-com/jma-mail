@@ -55,14 +55,28 @@ pub(crate) fn decide(
     {
         state.review = true;
         state.blocked = true;
-        state.error =
-            Some("Legacy flag histories disagree; choose an explicit repair policy".into());
+        state.error.get_or_insert_with(|| {
+            "Flag histories require review; choose an explicit repair authority".into()
+        });
         return FlagDecision {
             target: None,
             state,
         };
     }
 
+    // A pull may have renamed the file before its ACK transaction failed.
+    // If the server has since changed, that old target is not evidence of an
+    // independent MUA edit. Values alone cannot distinguish our effect from
+    // a coincident local edit, so do not repush it without explicit authority.
+    let unacknowledged_pull_target = state
+        .attempt
+        .as_ref()
+        .filter(|attempt| {
+            mapped_flags(&attempt.source_flags) != attempt.target_flags
+                && local == attempt.target_flags
+                && remote != attempt.target_flags
+        })
+        .map(|attempt| attempt.target_flags.clone());
     let newer_local_edit = state
         .attempt
         .as_ref()
@@ -75,6 +89,15 @@ pub(crate) fn decide(
             ConflictStrategy::ServerWins => remote,
         },
     };
+    if unacknowledged_pull_target.as_ref() == Some(&target) {
+        state.review = true;
+        state.blocked = true;
+        state.error = Some("Unacknowledged pull target may be our own rename; choose explicit flag authority before pushing".into());
+        return FlagDecision {
+            target: None,
+            state,
+        };
+    }
     FlagDecision {
         target: Some(target),
         state,
@@ -153,6 +176,48 @@ mod tests {
         assert_eq!(decision.target.as_deref(), Some("FS"));
         assert_eq!(decision.state.baseline.as_deref(), Some("S"));
         assert!(decision.state.attempt.is_some());
+    }
+
+    #[test]
+    fn unacknowledged_pull_target_cannot_authorize_a_fresh_push() {
+        for (baseline, source, target, local, remote, strategy) in [
+            ("", "X", "F", "FX", "S", ConflictStrategy::LocalWins),
+            ("S", "SX", "FS", "FSX", "S", ConflictStrategy::ServerWins),
+        ] {
+            let mut state = settled(baseline);
+            state.attempt = Some(FlagAttempt {
+                source_flags: source.into(),
+                target_flags: target.into(),
+                source_maildir_id: None,
+                source_folder: None,
+            });
+            let decision = decide(&state, local, remote, strategy);
+            assert!(decision.target.is_none());
+            assert!(decision.state.review && decision.state.blocked);
+            assert_eq!(decision.state.baseline, state.baseline);
+            assert_eq!(decision.state.attempt, state.attempt);
+        }
+    }
+
+    #[test]
+    fn unacknowledged_pull_does_not_block_a_safe_pull_or_distinct_mua_edit() {
+        let mut state = settled("");
+        state.attempt = Some(FlagAttempt {
+            source_flags: "X".into(),
+            target_flags: "F".into(),
+            source_maildir_id: None,
+            source_folder: None,
+        });
+        for (local, remote, strategy, expected) in [
+            ("FX", "S", ConflictStrategy::ServerWins, "S"),
+            ("TX", "S", ConflictStrategy::LocalWins, "T"),
+        ] {
+            let decision = decide(&state, local, remote, strategy);
+            assert_eq!(decision.target.as_deref(), Some(expected));
+            assert!(!decision.state.review);
+            assert_eq!(decision.state.baseline, state.baseline);
+            assert_eq!(decision.state.attempt, state.attempt);
+        }
     }
 
     #[test]

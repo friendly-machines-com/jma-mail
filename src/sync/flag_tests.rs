@@ -21,6 +21,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 mod generation;
 mod maildir_cases;
 mod partial;
+mod pull_ack;
 mod repair;
 
 const ACCOUNT_ID: &str = "u-test-account";
