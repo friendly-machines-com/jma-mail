@@ -75,6 +75,12 @@ pub struct Executor<'a> {
     self_writes: Option<Arc<SelfWriteCache>>,
 }
 
+#[derive(Default)]
+struct LocalMoveOutcome {
+    succeeded: usize,
+    failed_folders: HashSet<String>,
+}
+
 impl<'a> Executor<'a> {
     pub fn new(
         client: Arc<Client>,
@@ -225,7 +231,29 @@ impl<'a> Executor<'a> {
         let mut local_flags_actually_attempted = local_flags.len();
         let mut local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_attempted = local_moves.len();
-        let local_moves_count = self.move_local_messages(local_moves)?;
+        let local_move_outcome = self.move_local_messages(local_moves)?;
+        let local_moves_count = local_move_outcome.succeeded;
+        let folder_deletes_attempted = local_folder_deletes.len();
+        let local_folder_deletes: Vec<_> = local_folder_deletes
+            .into_iter()
+            .filter(|action| {
+                let SyncAction::DeleteLocalFolder { binding } = action else {
+                    return true;
+                };
+                let held = local_move_outcome
+                    .failed_folders
+                    .iter()
+                    .any(|folder| Path::new(folder).starts_with(&binding.maildir_folder));
+                if held {
+                    warn!(
+                        "Withholding deletion of {} after an incomplete local counter-move",
+                        binding.maildir_folder
+                    );
+                }
+                !held
+            })
+            .collect();
+        let deferred_folder_deletes = folder_deletes_attempted - local_folder_deletes.len();
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
         // DeleteLocalFolder runs after every per-message
         // local-side phase so any MoveLocal counter-action
@@ -364,6 +392,7 @@ impl<'a> Executor<'a> {
         let pull_apply_incomplete = local_flag_updates < local_flags_attempted
             || local_moves_count < local_moves_attempted
             || deferred_move_pairs > 0
+            || deferred_folder_deletes > 0
             || replan_required;
         let new_email_state = resolve_email_cursor(
             new_email_state,
@@ -394,11 +423,14 @@ impl<'a> Executor<'a> {
                 + local_moves_attempted
                 - local_moves_count,
             replan_required,
-            retryable_deferred_actions: retryable_deferred_actions + usize::from(replan_required),
+            retryable_deferred_actions: retryable_deferred_actions
+                + deferred_folder_deletes
+                + usize::from(replan_required),
             review_actions: review_actions + remote_counts.deferred,
             deferred_actions: remote_counts.deferred
                 + deferred_flags
                 + deferred_move_pairs
+                + deferred_folder_deletes
                 + usize::from(replan_required),
             // Selected history/status and scope authority belong to the engine,
             // which knows the resolved bindings. Never query the whole DB here.
@@ -419,11 +451,11 @@ impl<'a> Executor<'a> {
         )
     }
 
-    /// Returns the number of cross-folder local moves that landed
-    /// (file moved + DB row updated). Per-message `store::move_message`
-    /// failures are logged at warn and skipped here.
-    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<usize> {
-        let mut succeeded = 0usize;
+    /// Mirror the actual moved identity and raw suffix, not the stale source
+    /// binding or mapped server flags. Failed sources retain any dependent
+    /// folder destruction for a later full inventory/replan.
+    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<LocalMoveOutcome> {
+        let mut outcome = LocalMoveOutcome::default();
         for action in actions {
             let SyncAction::MoveLocal {
                 id,
@@ -433,63 +465,60 @@ impl<'a> Executor<'a> {
             else {
                 continue;
             };
-            let bound_for_log = id.clone();
-            let BoundId {
-                maildir_id,
-                jmap_email_id,
-                ..
-            } = id;
-            let from = store::ensure_maildir(&self.maildir_root.join(&from_folder))?;
-            let to = store::ensure_maildir(&self.maildir_root.join(&to_binding.maildir_folder))?;
-            if let Err(e) = store::move_message(&from, &to, maildir_id.as_ref()) {
-                warn!(
-                    "Failed to move {} from {} to {}: {}",
-                    bound_for_log, from_folder, to_binding.maildir_folder, e
-                );
+            let Some(record) = queries::get_message_by_jmap_id(self.conn, &id.jmap_email_id)?
+            else {
+                warn!("Cannot move {} without its cached binding", id);
+                outcome.failed_folders.insert(from_folder);
                 continue;
-            }
-            // Per-iteration transaction: the read, the conditional upsert
-            // of message_map, and the upsert of local_state must all land
-            // together so this row's two tables never disagree on the
-            // destination folder. With DEFERRED semantics the writer lock
-            // is only taken on the first write, so an external (non-engine)
-            // writer that bypasses the flock could in principle slip a
-            // change in between the read and the write -- accepted as
-            // layer-3 divergence; the next sync cycle re-reconciles.
-            let txn = self.conn.unchecked_transaction()?;
-            let flags = if let Some(rec) = queries::get_message_by_jmap_id(&txn, &jmap_email_id)? {
-                let preserved_flags = rec.flags.clone();
-                queries::upsert_message(
-                    &txn,
-                    &MessageRecord {
-                        jmap_mailbox_id: to_binding
-                            .jmap_mailbox_id
-                            .expect_resolved(
-                                "execute::move_local_messages -- jmap_mailbox_id DB write",
-                            )
-                            .clone(),
-                        ..rec
-                    },
-                )?;
-                preserved_flags
-            } else {
-                String::new()
             };
+            let from = maildir::Maildir::from(self.maildir_root.join(&from_folder));
+            let to = store::ensure_maildir(&self.maildir_root.join(&to_binding.maildir_folder))?;
+            let flags = match store::move_message(&from, &to, id.maildir_id.as_ref()) {
+                Ok(flags) => flags,
+                Err(error) => {
+                    warn!(
+                        "Failed to move {} from {} to {}: {}",
+                        id, from_folder, to_binding.maildir_folder, error
+                    );
+                    outcome.failed_folders.insert(from_folder);
+                    continue;
+                }
+            };
+            // A changed-basename counter must rebind and remove the old local
+            // observation atomically. Flags in message_map remain the server
+            // observation; this placement step does not acknowledge flags.
+            let txn = self.conn.unchecked_transaction()?;
+            if let Some(old_id) = &record.maildir_id
+                && old_id != &id.maildir_id
+            {
+                queries::delete_local_state(&txn, old_id)?;
+            }
+            queries::upsert_message(
+                &txn,
+                &MessageRecord {
+                    maildir_id: Some(id.maildir_id.clone()),
+                    jmap_mailbox_id: to_binding
+                        .jmap_mailbox_id
+                        .expect_resolved("move_local_messages -- destination")
+                        .clone(),
+                    ..record
+                },
+            )?;
             queries::upsert_local_state(
                 &txn,
-                &maildir_id,
+                &id.maildir_id,
                 &to_binding.maildir_folder,
                 &flags,
                 None,
             )?;
             txn.commit()?;
-            succeeded += 1;
+            outcome.succeeded += 1;
             info!(
                 "Moved {} from {} to {}",
-                bound_for_log, from_folder, to_binding.maildir_folder
+                id, from_folder, to_binding.maildir_folder
             );
         }
-        Ok(succeeded)
+        Ok(outcome)
     }
 
     /// Returns the number of local deletions that landed (DB rows

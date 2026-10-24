@@ -289,13 +289,50 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
     Ok(())
 }
 
-/// Move a message from one maildir to another.
-pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<()> {
-    from.move_to(id, to)
-        .with_context(|| format!("Failed to move message {}", id))?;
+/// Move one unique live identity, preserving its actual filename/suffix.
+/// Returns the raw moved flags for the local observation mirror. Like the
+/// previous Maildir move helper, the destination is cur/, including for a
+/// new/-side source. Refuse ambiguity and target collisions rather than
+/// choosing a random copy or overwriting it. This is snapshot validation,
+/// not atomic exclusion against arbitrary concurrent MUA writers.
+pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
+    let mut found = Vec::new();
+    for entry in from.list_cur().chain(from.list_new()) {
+        let entry = entry?;
+        if entry.id() == id && entry.path().is_file() {
+            found.push(entry);
+        }
+    }
+    anyhow::ensure!(
+        found.len() == 1,
+        "Expected one move source for {id}, found {}",
+        found.len()
+    );
+    let entry = found.pop().unwrap();
+    let flags = entry.flags().to_owned();
+    let source = entry.path();
+    let filename = source.file_name().context("Move source has no filename")?;
+    let target = to.path().join("cur").join(filename);
+    anyhow::ensure!(
+        source != &target && !target.exists(),
+        "Refusing existing move target {}",
+        target.display()
+    );
+    for entry in to.list_cur().chain(to.list_new()) {
+        anyhow::ensure!(
+            entry?.id() != id,
+            "Move target already contains identity {id}"
+        );
+    }
+    std::fs::rename(source, &target).with_context(|| format!("Failed to move message {id}"))?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(source.parent().unwrap())?.sync_all()?;
+        std::fs::File::open(target.parent().unwrap())?.sync_all()?;
+    }
     event!(target: TARGET_FILE_OP, Level::TRACE, op = "move");
     debug!("Moved message {} to {:?}", id, to.path());
-    Ok(())
+    Ok(flags)
 }
 
 #[cfg(test)]
@@ -323,6 +360,53 @@ mod tests {
                 nested.join(sub).display()
             );
         }
+    }
+
+    #[test]
+    fn move_snapshot_returns_actual_raw_suffix_from_cur_and_new() {
+        for subdir in ["cur", "new"] {
+            let dir = tempfile::tempdir().unwrap();
+            let from = ensure_maildir(&dir.path().join("from")).unwrap();
+            let to = ensure_maildir(&dir.path().join("to")).unwrap();
+            let source = from.path().join(subdir).join("id:2,FX");
+            std::fs::write(&source, b"same message bytes").unwrap();
+            assert_eq!(move_message(&from, &to, "id").unwrap(), "FX");
+            assert!(!source.exists());
+            assert_eq!(
+                std::fs::read(to.path().join("cur/id:2,FX")).unwrap(),
+                b"same message bytes"
+            );
+            assert_eq!(from.list_cur().chain(from.list_new()).count(), 0);
+            assert_eq!(to.list_cur().chain(to.list_new()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn move_snapshot_refuses_an_existing_target_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = ensure_maildir(&dir.path().join("from")).unwrap();
+        let to = ensure_maildir(&dir.path().join("to")).unwrap();
+        let source = from.path().join("cur/id:2,SX");
+        let target = to.path().join("cur/id:2,SX");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        assert!(move_message(&from, &to, "id").is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(target).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn move_snapshot_refuses_duplicate_source_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = ensure_maildir(&dir.path().join("from")).unwrap();
+        let to = ensure_maildir(&dir.path().join("to")).unwrap();
+        let source = from.path().join("cur/id:2,SX");
+        let duplicate = from.path().join("new/id:2,FX");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&duplicate, b"duplicate").unwrap();
+        assert!(move_message(&from, &to, "id").is_err());
+        assert!(source.is_file() && duplicate.is_file());
+        assert_eq!(to.list_cur().count(), 0);
     }
 
     #[test]

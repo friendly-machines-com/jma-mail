@@ -80,6 +80,8 @@ pub struct MessageRecordIndex {
     pub remote_observations: HashMap<JmapEmailId, EmailObject>,
     pub unverified_remote: HashSet<JmapEmailId>,
     pub retry_only: bool,
+    /// Fresh presence vetoes, not adoption authority or durable work items.
+    pub held_local_folders: HashSet<String>,
 }
 
 /// Bundle of immutable inputs and derived indices that every reconcile
@@ -99,6 +101,7 @@ struct ReconcileCtx<'a> {
     moved_ids: &'a HashSet<JmapEmailId>,
     unverified_remote: &'a HashSet<JmapEmailId>,
     retry_only: bool,
+    held_local_folders: &'a HashSet<String>,
     local_index: &'a LocalIndex,
     /// Per-file on-disk filename flag suffix from this cycle's scan
     /// (`scan::ScanResult.local_flags`). Reconcile reads it at
@@ -329,6 +332,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         moved_ids: &consumed_deletes,
         unverified_remote: &known.unverified_remote,
         retry_only: known.retry_only,
+        held_local_folders: &known.held_local_folders,
         local_index,
         local_flags,
         local_flag_changes,
@@ -638,10 +642,14 @@ fn finalize_local_orphan_handling(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
             .binding
             .jmap_mailbox_id
             .expect_resolved("orphan flag hold");
-        if plan.actions.iter().any(|action| matches!(action,
+        if ctx.held_local_folders.contains(&orphan.binding.maildir_folder) || plan.actions.iter().any(|action| matches!(action,
             SyncAction::DeferredFlagState { id, .. } if email_in_orphan(id, dead_id, ctx.known_by_jmap)
         )) {
             warn!("Deferring folder destruction for {}: flag history or presence is unresolved", dead_id);
+            // A live candidate may have a new basename while its cached row
+            // still points at another folder. Presence can veto destruction,
+            // but does not authorize adopting that unknown new/ copy.
+            plan.new_email_state = None;
             continue;
         }
         let (blockers, moots) = classify_actions_against_orphan(plan, orphan, ctx, &keep_mask);
@@ -758,10 +766,42 @@ fn resolve_server_wins_with_blocker(
         .binding
         .jmap_mailbox_id
         .expect_resolved("resolve_server_wins_with_blocker -- orphan binding is resolved");
-    for i in blockers {
-        if let Some(counter) = build_counter_move_local(&plan.actions[*i], folder, dead_id, ctx) {
-            additions.push(counter);
+    // Index once per orphan, not once per counter in a large move batch.
+    // None records ambiguity; duplicate adoptions never select a random file.
+    let mut destinations = HashMap::new();
+    for action in &plan.actions {
+        if let SyncAction::AdoptLocalMessage { id, binding, .. } = action
+            && binding.maildir_folder == *folder
+        {
+            destinations
+                .entry(&id.jmap_email_id)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(id));
         }
+    }
+    let mut held = false;
+    for i in blockers {
+        let SyncAction::MoveRemote { id, .. } = &plan.actions[*i] else {
+            continue;
+        };
+        let counter =
+            build_counter_move_local(&plan.actions[*i], folder, dead_id, ctx, &destinations);
+        let retryable = counter.is_some();
+        if let Some(counter) = counter {
+            additions.push(counter);
+        } else {
+            held = true;
+        }
+        additions.push(SyncAction::DeferredFlagState {
+            id: id.clone(),
+            retryable,
+            reason: if retryable {
+                "Folder policy superseded placement; refresh full metadata after the counter-move"
+            } else {
+                "No unique counter-move destination; preserve the orphan for review"
+            }
+            .into(),
+        });
     }
     for i in blockers {
         keep_mask[*i] = false;
@@ -769,9 +809,11 @@ fn resolve_server_wins_with_blocker(
     for i in moots {
         keep_mask[*i] = false;
     }
-    additions.push(SyncAction::DeleteLocalFolder {
-        binding: Arc::clone(&orphan.binding),
-    });
+    if !held {
+        additions.push(SyncAction::DeleteLocalFolder {
+            binding: Arc::clone(&orphan.binding),
+        });
+    }
 }
 
 /// User's intent (preserve local content) wins. Drop Blockers and
@@ -798,17 +840,16 @@ fn resolve_local_wins_with_blocker(
 /// For a `MoveRemote`-into-orphan Blocker, build the
 /// `MoveLocal { from: orphan, to: source }` counter that reverses
 /// the user's move before the orphan-destroy fires. Returns `None`
-/// for non-`MoveRemote` actions and for two warn-and-drop cases:
-/// the source folder isn't in the live set (also an orphan, or
-/// otherwise gone), or `known_by_jmap_to_maildir_id` can't
-/// reconstruct the file's local id (cycle-local adopt with no
-/// `message_map` row yet). In both warn-and-drop cases the file
-/// gets destroyed with the orphan folder rather than rescued.
+/// for non-`MoveRemote` actions or when the source is not live or the
+/// destination adoption is not unique. The adoption carries the actual
+/// observed destination identity; the cached source basename can already be
+/// absent after a MUA move/rename. Never reconstruct the destination from it.
 fn build_counter_move_local(
     action: &SyncAction,
     orphan_folder: &str,
     dead_id: &JmapMailboxId,
     ctx: &ReconcileCtx<'_>,
+    destinations: &HashMap<&JmapEmailId, Option<&BoundId>>,
 ) -> Option<SyncAction> {
     let SyncAction::MoveRemote {
         id, from_folder, ..
@@ -819,26 +860,21 @@ fn build_counter_move_local(
     let Some(source_binding) = ctx.mailboxes.by_folder(from_folder) else {
         warn!(
             "ServerWins counter-MoveLocal for orphan {}: source folder {} is not in live set; \
-             dropping counter and the user's move both -- file destroyed with orphan folder",
+             withholding counter and folder deletion for review",
             dead_id, from_folder
         );
         return None;
     };
-    let Some(maildir_id) = known_by_jmap_to_maildir_id(&id.jmap_email_id, ctx.known_by_jmap) else {
+    let Some(destination) = destinations.get(&&id.jmap_email_id).copied().flatten() else {
         warn!(
-            "ServerWins counter-MoveLocal for orphan {}: no maildir_id known for {} \
-             (cycle-local adopt with no message_map row yet); dropping counter and the user's \
-             move both -- file destroyed with orphan folder",
+            "ServerWins counter-MoveLocal for orphan {}: no unique observed destination for {}; \
+             refusing to guess a cached source basename",
             dead_id, id.jmap_email_id
         );
         return None;
     };
     Some(SyncAction::MoveLocal {
-        id: BoundId {
-            maildir_id,
-            jmap_email_id: id.jmap_email_id.clone(),
-            message_id: id.message_id.clone(),
-        },
+        id: destination.clone(),
         from_folder: orphan_folder.to_string(),
         to_binding: Arc::clone(source_binding),
     })
@@ -861,6 +897,15 @@ fn apply_orphan_decisions(
         .filter_map(|(i, a)| if keep_mask[i] { Some(a) } else { None })
         .collect();
     plan.actions = kept;
+    if additions
+        .iter()
+        .any(|action| matches!(action, SyncAction::DeferredFlagState { .. }))
+    {
+        // The dropped adoption may contain custom-only remote changes even
+        // when no flag rename was planned. Replay them after placement, never
+        // advance the cursor past discarded fresh metadata.
+        plan.new_email_state = None;
+    }
     plan.actions.extend(additions);
     for &orphan_idx in needs_resurrect {
         emit_resurrect_for(&ctx.mailboxes.local_orphans()[orphan_idx], ctx, plan);
@@ -1025,20 +1070,6 @@ fn build_counter_move_remote(
         from_folder: orphan_binding.maildir_folder.clone(),
         to_folder: source_binding.maildir_folder.clone(),
     })
-}
-
-/// Look up a maildir_id given a jmap_email_id via the
-/// `known_by_jmap` index. Used by counter-action emission to
-/// reconstruct the `BoundId` for a `MoveLocal` derived from a
-/// `MoveRemote` whose original `id: RemoteId` lacks the
-/// maildir_id.
-fn known_by_jmap_to_maildir_id(
-    jmap_email_id: &JmapEmailId,
-    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
-) -> Option<MaildirId> {
-    known_by_jmap
-        .get(jmap_email_id)
-        .and_then(|r| r.maildir_id.clone())
 }
 
 /// One paired DeletedMessage(src) + NewMessage(dst) discovered during
@@ -5442,8 +5473,8 @@ mod tests {
             assert_eq!(counters.len(), 1, "one counter MoveLocal for the Blocker");
             assert_eq!(
                 counters[0].0.maildir_id.as_ref(),
-                "OLD.host",
-                "maildir_id resolved via known_by_jmap"
+                "NEW.host",
+                "counter must use the observed destination basename"
             );
             assert_eq!(
                 counters[0].1, "Archive",

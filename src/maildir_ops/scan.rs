@@ -47,17 +47,37 @@ pub struct ScanResult {
 }
 
 /// A fresh presence check used before interpreting disappearance as deletion.
+#[derive(Default)]
 pub(crate) struct IdentityInventory {
-    ids: HashSet<MaildirId>,
-    message_ids: HashSet<String>,
+    ids: HashMap<MaildirId, HashSet<String>>,
+    message_ids: HashMap<String, HashSet<String>>,
 }
 
 impl IdentityInventory {
     pub(crate) fn contains(&self, id: &MaildirId, message_id: &MessageId) -> bool {
-        self.ids.contains(id)
+        self.ids.contains_key(id)
             || self
                 .message_ids
-                .contains(message_id.as_ref().trim_matches(['<', '>']))
+                .contains_key(message_id.as_ref().trim_matches(['<', '>']))
+    }
+
+    /// Presence can veto destruction of these folders as well as the Email.
+    /// It is not authority to adopt a candidate by Message-ID alone.
+    pub(crate) fn candidate_folders(
+        &self,
+        id: &MaildirId,
+        message_id: &MessageId,
+    ) -> HashSet<String> {
+        self.ids
+            .get(id)
+            .into_iter()
+            .chain(
+                self.message_ids
+                    .get(message_id.as_ref().trim_matches(['<', '>'])),
+            )
+            .flatten()
+            .cloned()
+            .collect()
     }
 }
 
@@ -65,10 +85,7 @@ pub(crate) fn inventory_identities<'a>(
     root: &Path,
     folders: impl IntoIterator<Item = &'a str>,
 ) -> Result<IdentityInventory> {
-    let mut inventory = IdentityInventory {
-        ids: HashSet::new(),
-        message_ids: HashSet::new(),
-    };
+    let mut inventory = IdentityInventory::default();
     for folder in folders {
         for subdir in ["cur", "new"] {
             let directory = root.join(folder).join(subdir);
@@ -87,14 +104,18 @@ pub(crate) fn inventory_identities<'a>(
                 let name = name.to_string_lossy();
                 inventory
                     .ids
-                    .insert(MaildirId::from(name.split(":2,").next().unwrap_or(&name)));
+                    .entry(MaildirId::from(name.split(":2,").next().unwrap_or(&name)))
+                    .or_default()
+                    .insert(folder.to_owned());
                 if !entry.file_type()?.is_file() {
                     continue;
                 }
                 if let Some(id) = parse_message_id_from_file(&entry.path())? {
                     inventory
                         .message_ids
-                        .insert(id.as_ref().trim_matches(['<', '>']).to_string());
+                        .entry(id.as_ref().trim_matches(['<', '>']).to_string())
+                        .or_default()
+                        .insert(folder.to_owned());
                 }
             }
         }

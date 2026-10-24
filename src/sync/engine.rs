@@ -630,8 +630,9 @@ impl<'a> SyncEngine<'a> {
                 scan_changes
             };
 
-        let deferred_actions =
+        let deferred_presence =
             defer_ambiguous_deletes(self.conn, &maildir_root, &mailboxes, &mut all_local_changes)?;
+        let deferred_actions = deferred_presence.count;
 
         // Convert `LocalChange::LocalFolderDeleted` events into
         // entries on `mailboxes.remote_orphans()`. Scan emits the
@@ -737,6 +738,7 @@ impl<'a> SyncEngine<'a> {
         // In particular they must not create a spurious delete/update conflict.
         let mut known = build_known_indices(self.conn, &mailboxes)?;
         known.retry_only = retry_only;
+        known.held_local_folders = deferred_presence.folders;
         let observed: HashSet<_> = remote_emails.iter().map(|email| email.id.clone()).collect();
         let destroyed: HashSet<_> = remote_destroyed.iter().cloned().collect();
         let verify: Vec<_> = known
@@ -1675,17 +1677,23 @@ fn hydrate_known_state(
 /// A partial or ambiguous inventory must not authorize a remote destroy.
 /// Exact move pairs remain for reconcile; other live identity candidates
 /// defer the deletion without implicitly importing an unknown new/ file.
+#[derive(Default)]
+struct DeferredLocalDeletes {
+    count: usize,
+    folders: HashSet<String>,
+}
+
 fn defer_ambiguous_deletes(
     conn: &Connection,
     root: &Path,
     mailboxes: &MailboxBindings,
     changes: &mut Vec<LocalChange>,
-) -> Result<usize> {
+) -> Result<DeferredLocalDeletes> {
     if !changes
         .iter()
         .any(|change| matches!(change, LocalChange::DeletedMessage { .. }))
     {
-        return Ok(0);
+        return Ok(DeferredLocalDeletes::default());
     }
     let known = build_known_indices(conn, mailboxes)?;
     let mut candidates = HashMap::new();
@@ -1709,7 +1717,7 @@ fn defer_ambiguous_deletes(
         }
     }
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(DeferredLocalDeletes::default());
     }
     let bindings = mailboxes.scan_set(true);
     let inventory = scan::inventory_identities(
@@ -1718,10 +1726,12 @@ fn defer_ambiguous_deletes(
             .iter()
             .map(|binding| binding.maildir_folder.as_str()),
     )?;
+    let mut folders = HashSet::new();
     let deferred: HashSet<_> = candidates.into_iter().filter_map(|(id, message_id)| {
         let live = inventory.contains(&id, &message_id);
         if live {
             warn!("Deferring deletion of {}: a live identity candidate still exists in cur/ or new/", id);
+            folders.extend(inventory.candidate_folders(&id, &message_id));
             Some(id)
         } else { None }
     }).collect();
@@ -1730,7 +1740,10 @@ fn defer_ambiguous_deletes(
             LocalChange::DeletedMessage { maildir_id, .. } if deferred.contains(maildir_id)
         )
     });
-    Ok(deferred.len())
+    Ok(DeferredLocalDeletes {
+        count: deferred.len(),
+        folders,
+    })
 }
 
 fn flag_mailbox_ids(mailboxes: &MailboxBindings) -> Vec<JmapMailboxId> {

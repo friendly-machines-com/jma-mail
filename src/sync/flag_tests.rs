@@ -19,6 +19,7 @@ use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod generation;
+mod maildir_cases;
 mod repair;
 
 const ACCOUNT_ID: &str = "u-test-account";

@@ -264,8 +264,31 @@ the Email cursor so replay retains its fresh metadata. Flag-only receipts do
 not acknowledge mailbox placement. Truly competing selected mailbox
 destinations are deferred for review rather than arbitrarily counter-moved.
 When folder policy replaces a move with a counter-move, its destination flag
-pull is deferred and the cursor held for a post-counter replan, not allowed
-to escape into the ordinary pre-membership flag phase.
+pull is deferred, not allowed into the ordinary pre-membership flag phase.
+Every counter holds the Email cursor and requests a fresh full replan, even
+when mapped flags agree: the discarded adoption may contain custom-only
+metadata which must not disappear behind an advanced cursor.
+
+Counter-moves take the actual destination BoundId from the unique paired
+adoption, never the cached old basename. `store::move_message` requires one
+live source across cur/new, refuses target identity collisions and returns the
+raw moved suffix. The executor atomically rebinds that Maildir ID, removes the
+old local observation and stores the actual suffix, preserving server keyword
+observations and the flag baseline separately. It retains the existing move
+to-cur convention, including for a new-side source. Failed counters withhold
+dependent folder deletion and keep the cycle retryable; missing/ambiguous
+counter destinations hold the orphan for review rather than guessing.
+
+Deletion presence inventory now retains candidate folders as well as IDs.
+`engine::DeferredLocalDeletes` feeds fresh per-cycle `held_local_folders` into
+the planner independently of the adoption-only LocalIndex (which is usually
+empty in steady state). An unresolved changed-ID new-side candidate therefore
+vetoes both Email destruction and removal of the folder containing it across
+idle cycles/reopen. This presence veto does not authorize adopting or importing
+unknown new mail. Ordinary promotion to cur can make it a supported move pair;
+unresolved copies remain visibly deferred. These are not durable payload jobs
+or a content-digest identity proof. Regression cases are in
+`flag_tests/maildir_cases.rs`, with collision/duplicate controls in store.rs.
 
 ### Explicit targeted flag repair
 
