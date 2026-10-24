@@ -47,7 +47,11 @@ tools/test-stalwart-native.sh
 SH
 ```
 
-The runner builds outside the sandbox, then executes the compiled test binary
+The runner defaults to `e2e_flag_sync`. Pass Cargo test-target names or quoted
+patterns to select more suites, for example `tools/test-stalwart-native.sh 'e2e_*'`
+for all seven Stalwart targets. Every selected binary and its tests run serially.
+
+The runner builds outside the sandbox, then executes the compiled test binaries
 with loopback-only networking and a private tmpfs /var. Native fixture startup
 refuses an unsafe host environment. `JMA_TEST_NATIVE_STALWART` selects the
 executable; it is not a URL or permission to use an existing server. Every
@@ -58,7 +62,11 @@ environment, and stops/waits for its child before deleting its directory.
 `x:Bootstrap/set` **updating** the singleton. That returns generated fixture
 admin credentials; restart into the normal account, mint a Bearer via
 `x:ApiKey/set`, replace default listeners with high loopback HTTP/IMAP ports,
-enable test-only plaintext IMAP authentication, and restart again. Bootstrap
+enable test-only plaintext IMAP authentication, and restart again. Before seeding,
+the fixture also creates `x:Search` with the Docker snapshot's `indexEmailFields`
+map, including `headers: true`, requiring positive creation ACK and persisted
+readback after restart. Bootstrap defaults leave headers unindexed: mailbox pulls
+and flag tests can pass while rebind header queries return no matches. Bootstrap
 listeners and default log paths are confined to the private namespaces. The
 Docker path and its container teardown order remain unchanged. Existing public
 fixture fields/seeding helpers still support examples/bench-server.rs.
@@ -71,8 +79,8 @@ removals plus a tracked move into new/, server pulls/promotion, both missing-pee
 shapes, custom preservation, identity/blob/thread/body stability and real
 stateMismatch rejection. This focused F/S gate is separate from the exhaustive
 six-bit stateful model; neither proves arbitrary cross-writer linearizability.
-Native v0.16.4 execution does not establish a hosted CI result or required-branch
-status, and does not imply every other ignored Docker E2E target ran locally.
+Native v0.16.4 execution does not establish the Docker/MySQL backend, a hosted CI
+result, or required-branch status.
 
 ## Source layout
 

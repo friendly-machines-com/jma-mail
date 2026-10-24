@@ -344,6 +344,28 @@ pub(super) async fn spawn(executable: OsString) -> Result<JmapFixture> {
         )
         .await?,
     )?;
+    // Match the Docker fixture's search configuration before any APPEND.
+    // Bootstrap defaults leave headers unindexed: inMailbox pulls and flag
+    // tests work, but rebindfolders' header queries then find no messages.
+    let search = rpc(
+        &http,
+        setup_url,
+        &admin,
+        "x:Search/set",
+        json!({"create":{"singleton":{"indexEmailFields":{
+            "from":true,"to":true,"cc":true,"bcc":true,
+            "subject":true,"body":true,"attachment":true,
+            "receivedAt":true,"sentAt":true,"size":true,
+            "hasAttachment":true,"headers":true
+        }}}}),
+    )
+    .await?;
+    let search_id = search["created"]["singleton"]["id"]
+        .as_str()
+        .with_context(|| {
+            format!("native search configuration creation not acknowledged: {search}")
+        })?
+        .to_owned();
     process.stop()?;
 
     let public_url = format!("http://127.0.0.1:{http_port}");
@@ -364,6 +386,22 @@ pub(super) async fn spawn(executable: OsString) -> Result<JmapFixture> {
             .as_str()
             .is_some_and(|url| url.starts_with(&public_url)),
         "native API URL is not the final loopback listener"
+    );
+    let search = rpc(
+        &http,
+        &public_url,
+        &Auth::Bearer(bearer.clone()),
+        "x:Search/get",
+        json!({"ids":[&search_id]}),
+    )
+    .await?;
+    ensure!(
+        search["list"].as_array().is_some_and(|configs| {
+            configs.len() == 1
+                && configs[0]["id"].as_str() == Some(search_id.as_str())
+                && configs[0]["indexEmailFields"]["headers"] == true
+        }),
+        "native header indexing readback not verified after restart: {search}"
     );
     super::wait_for_imap(imap_port).await?;
     Ok(JmapFixture {
