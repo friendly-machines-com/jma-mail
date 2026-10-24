@@ -26,6 +26,54 @@ Single test, by name path:
 CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 ```
 
+### Real Stalwart flag gate
+
+`tests/e2e_flag_sync.rs` is ignored by the ordinary test run but explicitly
+included in the E2E workflow's locked, serial `e2e_* --ignored` invocation.
+The default backend is the existing Docker Stalwart/MySQL snapshot:
+
+```sh
+cargo test --locked --test e2e_flag_sync -- --ignored --nocapture --test-threads=1
+```
+
+For native Stalwart v0.16 on Linux, use the isolated runner (requires enabled
+unprivileged user/network/mount namespaces). A tested Guix invocation is:
+
+```sh
+guix shell git gcc-toolchain openssl pkg-config stalwart util-linux iproute2 python -- bash <<'SH'
+set -e
+export LD_LIBRARY_PATH="$(dirname "$(cc -print-file-name=libgcc_s.so.1)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+tools/test-stalwart-native.sh
+SH
+```
+
+The runner builds outside the sandbox, then executes the compiled test binary
+with loopback-only networking and a private tmpfs /var. Native fixture startup
+refuses an unsafe host environment. `JMA_TEST_NATIVE_STALWART` selects the
+executable; it is not a URL or permission to use an existing server. Every
+fixture has fresh temporary config/storage, clears inherited Stalwart config
+environment, and stops/waits for its child before deleting its directory.
+
+`tests/common/native.rs` bootstraps fresh RocksDB with typed JSON through
+`x:Bootstrap/set` **updating** the singleton. That returns generated fixture
+admin credentials; restart into the normal account, mint a Bearer via
+`x:ApiKey/set`, replace default listeners with high loopback HTTP/IMAP ports,
+enable test-only plaintext IMAP authentication, and restart again. Bootstrap
+listeners and default log paths are confined to the private namespaces. The
+Docker path and its container teardown order remain unchanged. Existing public
+fixture fields/seeding helpers still support examples/bench-server.rs.
+
+IMAP APPEND seeds Seen/Flagged/custom-keyword messages independently of jma's
+mutation path. Tests run real SyncEngine cycles, fresh independent Email/get
+and full-keyword oracle writes (never SDK keyword(false)), actual filenames,
+SQLite observations/baselines and later idle checks. Coverage includes local
+removals plus a tracked move into new/, server pulls/promotion, both missing-peer
+shapes, custom preservation, identity/blob/thread/body stability and real
+stateMismatch rejection. This focused F/S gate is separate from the exhaustive
+six-bit stateful model; neither proves arbitrary cross-writer linearizability.
+Native v0.16.4 execution does not establish a hosted CI result or required-branch
+status, and does not imply every other ignored Docker E2E target ran locally.
+
 ## Source layout
 
 - `src/main.rs` -- subcommand dispatch and lock acquisition.
