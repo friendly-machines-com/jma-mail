@@ -2164,7 +2164,9 @@ fn apply_update_local_flags(
             message_id,
         } = id;
         let maildir_path = maildir_root.join(&binding.maildir_folder);
-        let maildir = store::ensure_maildir(&maildir_path)?;
+        // Flag effects never provision a missing mailbox. A vanished/partial
+        // source must fail snapshot validation without creating directories.
+        let maildir = maildir::Maildir::from(maildir_path.clone());
         // Persist the generation before the filesystem effect, separately
         // from its acknowledgement. Never overwrite a newer filename edit.
         flag_sync::prepare_attempt(

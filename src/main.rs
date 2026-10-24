@@ -150,6 +150,11 @@ async fn main() -> Result<()> {
         Command::Init { no_interactive } => cmd_init(&cli, no_interactive).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
         Command::Status => cmd_status(&cli).await,
+        Command::RepairFlags {
+            authority,
+            apply,
+            email_ids,
+        } => cmd_repair_flags(&cli, authority, apply, email_ids).await,
         Command::Sync { args } => cmd_sync(&cli, args.dry_run).await,
         Command::Pull { dry_run } => cmd_pull(&cli, dry_run).await,
         Command::Push { dry_run } => cmd_push(&cli, dry_run).await,
@@ -607,6 +612,47 @@ fn format_bytes(n: u64) -> String {
 fn acquire_mutator_locks(config: &Config) -> Result<()> {
     maildir_ops::lock::acquire_lock(&config.maildir_path())?;
     state::db::acquire_lock(&config.db_path())?;
+    Ok(())
+}
+
+async fn cmd_repair_flags(
+    cli: &Cli,
+    authority: jma_mail::sync::flag_repair::FlagAuthority,
+    apply: bool,
+    email_ids: Vec<String>,
+) -> Result<()> {
+    let config = load_config(cli)?;
+    anyhow::ensure!(
+        config.db_path().is_file(),
+        "Flag repair requires an existing state DB; it never rebuilds bindings"
+    );
+    // Serialize the preview as well as apply against cooperating jma mutators.
+    // Unlike ordinary sync, never recreate a mismatched history database.
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open(&config.db_path())?;
+    let client = Arc::new(session::connect(&config.account, &conn).await?);
+    let ids: Vec<_> = email_ids.into_iter().map(Into::into).collect();
+    let preview =
+        jma_mail::sync::flag_repair::inspect(&client, &conn, &config, &ids, authority).await?;
+    println!("{preview}");
+    if !apply {
+        return Ok(());
+    }
+    let outcome = preview.apply(client, &conn, &config).await
+        .context("Flag repair incomplete; review is retained for unfinished effects; rerun repair-flags explicitly")?;
+    anyhow::ensure!(
+        outcome.failed_remote_actions == 0
+            && outcome.retryable_local_actions == 0
+            && !outcome.replan_required,
+        "Flag repair incomplete: {} failed remote, {} failed local, fresh preview required={}; rerun repair-flags explicitly",
+        outcome.failed_remote_actions,
+        outcome.retryable_local_actions,
+        outcome.replan_required
+    );
+    println!(
+        "Flag repair applied: {} flag effect(s) acknowledged. Account cursors unchanged.",
+        outcome.flag_updates
+    );
     Ok(())
 }
 

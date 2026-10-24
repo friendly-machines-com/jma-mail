@@ -96,6 +96,18 @@ pub enum Command {
     Mailboxes,
     /// Show sync staleness, cursor health, and maildir drift.
     Status,
+    /// Review/repair flags for explicit bound JMAP Email IDs (preview by default)
+    RepairFlags {
+        /// Which current six-flag set to use; independent of conflict_strategy
+        #[arg(long, value_enum)]
+        authority: crate::sync::flag_repair::FlagAuthority,
+        /// Apply the preview. Interrupted repairs require an explicit rerun.
+        #[arg(long)]
+        apply: bool,
+        /// Explicit JMAP Email IDs, not RFC Message-IDs; no wildcard or all mode
+        #[arg(required = true, num_args = 1.., value_name = "EMAIL_ID")]
+        email_ids: Vec<String>,
+    },
     /// Manage account credentials and the JMAP discovery cache
     Auth {
         #[command(subcommand)]

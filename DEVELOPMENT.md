@@ -47,7 +47,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
   - `folder_checkpoint` -- per-folder `(cur_mtime, new_mtime, cur_count, new_count)` snapshot written at the tail of every successful Full cycle. Phase 0 reads it to skip the dedupe walk for folders whose on-disk state hasn't changed; see [The sync cycle](#the-sync-cycle).
 
   Access goes through `queries.rs` or the narrowly scoped `flag_sync.rs` history API. Keep SQL in the state layer.
-- `src/sync/` -- orchestration (engine, plan, reconcile, execute), the shared flag decision in `flag_resolution.rs`, cached selected-history reporting in `status.rs`, and the daemon's self-write cache in `self_writes.rs`. See [Sync internals](#sync-internals) below.
+- `src/sync/` -- orchestration (engine, plan, reconcile, execute), the shared flag decision in `flag_resolution.rs`, explicit targeted authority in `flag_repair.rs`, cached selected-history reporting in `status.rs`, and the daemon's self-write cache in `self_writes.rs`. See [Sync internals](#sync-internals) below.
 - `src/janitor/` -- maintenance tasks invokable from the engine's Phase 0 and from `jma janitor <task>` CLI subcommands. Today: `dedupe`, `remotededupe`, `rebindfolders`, `prune` (issue #8). Reserved-but-empty: `db_gc`. Each task is a thin orchestration over the underlying primitive (e.g. `janitor::dedupe::run` wraps `sync::dedupe::plan_dedupe` + `apply_dedupe` with the empty-folder-list short-circuit); `prune` is offline drift remediation built on `maildir_ops::drift` + `removal` (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)).
 - `src/profile.rs` -- per-run profiling layer. Aggregates `tracing` spans and events from the sync engine and maildir ops into a phase-by-phase summary (timings, blob throughput, file-op counts, RSS deltas). Output is opt-in via `--profile` (stderr table) and `--profile-json <PATH>` (NDJSON per cycle in daemon mode).
 - `src/daemon/` -- `watch` mode. `runner.rs` owns the FS watcher and long-lived engine, performs the initial full sync, then runs SSE sessions. `eventsource.rs` listens on the JMAP `eventSourceUrl`; `watcher.rs` debounces filesystem notifications and classifies batches via `classify.rs` before emitting. Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s. `retry.rs` owns the independent retained-work deadline and permanent-rejection mask across sessions. The trigger loop dispatches path-driven local cycles, normal full cycles, or full retry cycles. See [Trigger pipeline](#trigger-pipeline). `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
@@ -244,8 +244,8 @@ acknowledge histories. Existing DB-opening/schema initialization is unchanged.
 Full/manual cycles can reassess retained discrepancies. Watch mode also has
 an event-independent retry deadline (see below). Email-state preconditions
 and fresh generation replanning are described below; targeted legacy
-authority repair remains separate. Neither a timer nor a conditional write
-recovers discarded DB history.
+authority repair uses the separate flags-only path below. Neither a timer nor
+a conditional write recovers discarded DB history.
 Unresolved flag histories hold destructive local-orphan handling, while mere
 metadata observations are not user-change blockers. Moves and adoption use
 the same baseline decision as ordinary updates. A move uses the observed
@@ -266,6 +266,47 @@ destinations are deferred for review rather than arbitrarily counter-moved.
 When folder policy replaces a move with a counter-move, its destination flag
 pull is deferred and the cursor held for a post-counter replan, not allowed
 to escape into the ordinary pre-membership flag phase.
+
+### Explicit targeted flag repair
+
+`sync/flag_repair.rs::inspect` powers `jma repair-flags --authority
+local|server EMAIL_ID...`, with preview by default and explicit `--apply`.
+It never calls `SyncEngine::run`: no dedupe, body transfer, imports, destroys,
+mailbox resolution writes or placement repair. It captures Email state before
+fresh metadata gets, verifies live configured selection, unique cached-folder
+identity, exact file path/raw suffix and Message-ID, blob/thread and sentinel
+anchors. Missing/duplicate/moved/multiple-mailbox/partial-Maildir targets are
+refused. The conservative inventory reads bounded headers across cached
+folders, including excluded ones to detect ambiguity; it is not a body digest.
+
+Inspection performs SELECTs only. Its private, consuming `FlagRepair` preview
+revalidates server/account, selection, bindings, histories, files (including
+inode/device on Unix) and Email state before writes. Apply constructs only
+ObserveMessage, RecordFlagState, UpdateLocalFlags and UpdateRemoteKeywords
+for the explicit targets. It passes the captured guard to the executor but
+leaves `new_email_state=None`: targeted inspection cannot advance the global
+Email cursor. Keyword patches preserve fresh full custom metadata; local
+renames preserve unowned suffix letters. The shared local flag handler no
+longer calls ensure_maildir; a vanished source fails without creating folders.
+
+Explicit authority does not infer history from a reviewed candidate baseline.
+Before disagreeing effects, apply retains the old/NULL baseline and sets review.
+Receipt preparation/failure preserves review; only successful rename/positive
+conditional ACK (or later verified agreement) clears it. Thus an interrupted
+repair cannot be undone by ordinary sync under the opposite global conflict
+policy. Re-preview and explicit rerun are required for remaining disagreement;
+there is no new durable authority queue and no all-target transaction. Existing
+receipt ambiguity and partial-chunk acknowledgement rules still apply. CLI
+incomplete apply returns nonzero; it does not automatically replay stale input.
+
+The command takes maildir then DB locks for preview and apply and requires an
+existing DB, using `db::open`, never `open_or_recreate`. Standard schema
+initialization and session discovery-cache writes still apply; preview's
+SELECT-only guarantee concerns repair observations/history, not those existing
+open/connect behaviors or the lock files. It does not fix folder identity or
+recreate missing directories. A DB rebuild still discards flag history.
+Stateful regressions live in `flag_tests/repair.rs`; `tests/flag_repair.rs`
+executes the real CLI against a strict stateful metadata/keyword-only peer.
 
 ### Email snapshot guards and generation replanning
 
@@ -333,7 +374,7 @@ Two distinct surfaces need protection from concurrent mutation, plus write-coher
 
 ### Maildir mutual exclusion
 
-`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jma.lock`. Mutating jma invocations (`sync`, `pull`, `push`, `watch`) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
+`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jma.lock`. Mutating jma invocations (`sync`, `pull`, `push`, `watch`, `repair-flags`, including repair preview) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
 
 The lock keys on the maildir root, not the state DB, because the maildir is the shared mutation surface across processes. Two configs pointing at *different* state DBs but the *same* maildir would otherwise race -- both could write the same Message-ID under different filenames and clobber each other. Per-account-Maildir-root is the universal convention across mbsync, OfflineIMAP, getmail, etc., so this serializes exactly what needs serializing without artificially preventing legitimate multi-account setups (different accounts -> different roots -> different locks).
 
