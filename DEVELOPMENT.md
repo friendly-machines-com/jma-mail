@@ -36,7 +36,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 - `src/ids.rs` -- newtype wrappers for the various string IDs (see [ID newtypes](#id-newtypes)).
 - `src/domain.rs` -- neutral domain types shared across layers (`MailboxObject`, `MailboxFolderBinding`, `MaybeReference`, `MailboxIndex`). Depends only on `ids` + `std`; produced by `jmap`, consumed by `maildir_ops` and `sync`, so it lives below both peers rather than inside either (see [Data model](#data-model)).
 - `src/jmap/` -- JMAP client wrapper. `session.rs` opens the connection, `discovery.rs` resolves the session URL via DNS SRV / well-known per RFC 8620 section 2.2, `limits.rs` clamps every server-advertised cap against a hardcoded ceiling (so a hostile or buggy server can't induce DoS via absurd values), `email.rs` is the per-method veneer over `jmap-client`, `mailbox.rs` handles `Mailbox/get`, `retry.rs` classifies errors as transient vs hard, `types.rs` holds the internal `EmailObject` shape.
-- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps the `maildir` crate for read/write, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout` and applies any matching `[[rename_rules]]`, `lock.rs` takes the per-maildir advisory lock, `drift.rs` classifies maildir-vs-DB drift into the four classes `status` and `janitor prune` consume (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)), `removal.rs` owns `remove_maildir_tree` -- the single guarded folder delete (path-escape guard, rescue of unmapped local-only files before deletion, then the state-DB cascade) that every in-crate destroy path routes through.
+- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps message writes, `entries.rs` supplies strict non-creating cur/new inventory, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `sync/dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout` and applies any matching `[[rename_rules]]`, `lock.rs` takes the per-maildir advisory lock, `drift.rs` classifies maildir-vs-DB drift into the four classes `status` and `janitor prune` consume (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)), `removal.rs` owns `remove_maildir_tree` -- the single guarded folder delete (path-escape guard, rescue of unmapped local-only files before deletion, then the state-DB cascade) that every in-crate destroy path routes through.
 - `src/state/` -- SQLite. Schema defined inline in `db.rs`; version constant is `db.rs::SCHEMA_VERSION`. Tables:
   - `jmap_state` -- per-entity sync cursor, one row per `(account, entity)`. `("acct", "Email")` ratchets in `execute`; `("acct", "Mailbox")` is stamped at the cycle tail from the `Mailbox/get` state, gated on the cycle's staged `mailbox_map` writes having landed so the cursor never advances past a cache that is still catching up. The Mailbox cursor also gates the fetch: a `Mailbox/changes` delta touching no structural property (empty, or only `totalEmails`/`unreadEmails`/`totalThreads`/`unreadThreads` per RFC 8621 section 2.2) lets `resolve_mailboxes` rebuild the set from `mailbox_map` and skip the full `Mailbox/get`; `janitor prune` clears it when it drops a `mailbox_map` row out of band, since the server-state cursor cannot otherwise see that local mutation. Both seed the daemon's SSE state-change dedup cache so the first event after connect isn't a redundant trigger.
   - `message_map` -- JMAP<->maildir binding, indexed on `maildir_id`, `message_id`, `jmap_mailbox_id`.
@@ -785,6 +785,37 @@ All three knobs are advanced/debug-only and intentionally undocumented in the us
 If you find yourself wanting to recommend a tuning change to a user, the right move is usually to investigate whether the default actually broke or whether something upstream (an MUA bug, a non-atomic move, fsevents drops) is the real cause.
 
 ## Maildir semantics
+
+### Partial Maildirs and strict inventory
+
+Either cur/ or new/ makes a Maildir present; an empty peer removed by a cleanup
+tool does not make its live messages disappear. `store::try_open_maildir`
+uses that shape without creating directories. Authoritative reads use
+`maildir_ops::entries::read`: the pinned Maildir iterator silently suppresses
+*all* initial read_dir errors, not just NotFound. The shared reader opens both
+present peers before yielding entries, skips only missing peers and dot files,
+keeps raw suffixes and typed IDs, and propagates other open/entry errors.
+Bare new-side IDs remain valid; malformed cur-side filenames are errors.
+
+Scan, dedupe/adoption indexing, orphan catalogs, rescue-before-delete, prune
+counts and flag/move snapshots use this reader. An unreadable peer cannot
+become an empty inventory or a prune Safe label. Reads and previews do not heal
+folders. Checkpoints represent a missing peer with zero mtime/count, so later
+creation dirties the folder; present unreadable sides remain errors. Both
+checkpoint gates recognize either peer, allowing new-only files to participate
+in rebuild adoption rather than being downloaded again.
+
+Only an actual message write may create its required target peer (for example
+new-to-cur Seen promotion). The helper creates that leaf only, not the mailbox
+or its ancestors, and syncs its parent on Unix. A missing mailbox still fails
+snapshot validation. Non-Seen updates in new/ and cur-only renames do not
+create unrelated peers. The explicit repair-flags command intentionally keeps
+its stricter complete-Maildir validation; ordinary sync handles partial shapes.
+Tests cover local pushes/previews, remote pulls, rebuild adoption, checkpoints,
+and present-but-unreadable-peer refusals. This does not change Message-ID's
+identity limits, DB rebuild semantics or unrelated best-effort sampling tools.
+
+### Format conventions
 
 Three under-specified parts of the maildir format have shaped specific choices in `maildir_ops`. The in-code docstrings cover *what* jma does; this section covers the surrounding ecosystem that explains *why*.
 

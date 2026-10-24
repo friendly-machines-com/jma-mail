@@ -1,5 +1,4 @@
 use anyhow::Result;
-use maildir::Maildir;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
@@ -283,35 +282,32 @@ fn has_in_flight_promotion(candidates: &[Candidate]) -> bool {
 /// the folder identity isn't returned because the caller already knows
 /// which folder this result came from via the input ordering.
 fn scan_folder(maildir_root: &Path, folder: &str) -> Result<Vec<(MessageId, Candidate)>> {
-    // Delegate "what counts as a maildir file" to the crate:
-    // list_cur/list_new filter dot-prefixed entries (.DS_Store,
-    // .nfsXXXX) and enforce the `<unique>:2,<flags>` convention.
-    // Maildir::from(PathBuf) is a pure constructor, and the
-    // iterators yield nothing when the subdir is missing, so
-    // plan_dedupe stays non-mutating and the "skip missing folder"
-    // behavior is preserved.
-    let md = Maildir::from(maildir_root.join(folder));
+    // Missing peers are empty; present unreadable sides must fail the plan.
+    // The shared reader preserves dot filtering and actual cur/new placement
+    // without the dependency's silent read_dir-error suppression.
     let mut out = Vec::new();
-    for entry in md.list_cur() {
-        push_candidate(entry?, Subdir::Cur, &mut out)?;
-    }
-    for entry in md.list_new() {
-        push_candidate(entry?, Subdir::New, &mut out)?;
+    for entry in crate::maildir_ops::entries::read(&maildir_root.join(folder))? {
+        let entry = entry?;
+        let subdir = if entry.in_new {
+            Subdir::New
+        } else {
+            Subdir::Cur
+        };
+        push_candidate(entry, subdir, &mut out)?;
     }
     Ok(out)
 }
 
-/// Shared cur/new entry classification, factored out so the two walk
-/// loops in `scan_folder` stay parallel. Returns Ok(()) for both
+/// Shared cur/new entry classification. Returns Ok(()) for both
 /// "added a candidate" and "skipped (no Message-ID header)" -- the
 /// caller treats both as non-failures.
 fn push_candidate(
-    entry: maildir::MailEntry,
+    entry: crate::maildir_ops::entries::Entry,
     subdir: Subdir,
     out: &mut Vec<(MessageId, Candidate)>,
 ) -> Result<()> {
-    let maildir_id = MaildirId::from(entry.id());
-    let path = entry.path().clone();
+    let maildir_id = entry.maildir_id;
+    let path = entry.path;
 
     let msgid = match parse_message_id_from_file(&path)? {
         Some(id) => id,

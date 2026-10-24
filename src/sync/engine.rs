@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::domain::{MailboxFolderBinding, MailboxObject, MaybeReference};
@@ -1532,7 +1532,7 @@ fn compute_dirty_folders(
         // reads `cur/`/`new/`; a maildir-shaped folder absent at
         // this point can't have grown duplicates since the last
         // checkpoint (it has no files at all).
-        if !path.join("cur").is_dir() {
+        if !store::is_maildir(&path) {
             continue;
         }
         let current = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
@@ -1643,7 +1643,7 @@ fn record_folder_checkpoints(
         // has nothing to checkpoint. The next cycle's
         // `compute_dirty_folders` will treat the still-absent
         // folder as trivially clean too.
-        if !path.join("cur").is_dir() {
+        if !store::is_maildir(&path) {
             continue;
         }
         let snapshot = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
@@ -2667,40 +2667,8 @@ fn enumerate_local_orphan_messages(
         .jmap_mailbox_id
         .expect_resolved("enumerate_local_orphan_messages -- orphan binding is resolved");
     let folder_path = maildir_root.join(&orphan.binding.maildir_folder);
-    let maildir = match store::try_open_maildir(&folder_path) {
-        Some(md) => md,
-        None => {
-            // `try_open_maildir` returns None for: folder
-            // missing (external action already resolved the
-            // orphan from our side), folder present but
-            // missing `cur/` (no maildir-shaped content), or
-            // a stat failure (permission, EIO, etc.). The
-            // first two reduce to "nothing to catalog." The
-            // third is user-actionable -- surface so the
-            // cause is visible before a downstream destroy
-            // or resurrect fails for the same reason with
-            // less context.
-            match std::fs::metadata(&folder_path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    error!(
-                        "Cannot read orphan folder {}: {} -- skipping its \
-                         message catalog; downstream destroy or resurrect \
-                         will likely fail for the same reason",
-                        folder_path.display(),
-                        e
-                    );
-                }
-                _ => {
-                    debug!(
-                        "Orphan folder {} has nothing to catalog (folder \
-                         absent or no `cur/`)",
-                        folder_path.display()
-                    );
-                }
-            }
-            return Ok(Vec::new());
-        }
-    };
+    // Missing peers are empty, but an unreadable present side must abort
+    // resolution rather than authorize destruction from an empty catalog.
 
     // Index DB rows by `maildir_id` for an O(1) file->row join
     // during the directory walk. Files always have a
@@ -2718,10 +2686,10 @@ fn enumerate_local_orphan_messages(
     }
 
     let mut messages = Vec::new();
-    for entry in maildir.list_cur().chain(maildir.list_new()) {
+    for entry in crate::maildir_ops::entries::read(&folder_path)? {
         let entry = entry?;
-        let maildir_id = MaildirId::from(entry.id());
-        let path = entry.path().to_path_buf();
+        let maildir_id = entry.maildir_id;
+        let path = entry.path;
         // I/O failures propagate; `Ok(None)` (no parseable
         // Message-ID header) drops at `debug!` rather than
         // `error!` because the orphan folder is destined for
@@ -2738,7 +2706,7 @@ fn enumerate_local_orphan_messages(
                 continue;
             }
         };
-        let flags = entry.flags().to_string();
+        let flags = entry.flags;
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let jmap_email_id = bound_by_maildir
             .get(&maildir_id)

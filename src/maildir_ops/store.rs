@@ -4,6 +4,7 @@ use std::path::Path;
 use tracing::{Level, debug, event};
 
 use crate::ids::MaildirId;
+use crate::maildir_ops::entries;
 use crate::profile::TARGET_FILE_OP;
 
 /// Ensure a maildir folder exists with cur/new/tmp subdirectories.
@@ -14,20 +15,11 @@ pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
     Ok(md)
 }
 
-/// Return a `Maildir` handle iff the folder is shaped like a
-/// maildir: specifically, `<path>/cur/` exists. `None` when
-/// either the folder itself is missing or its `cur/` subdir
-/// hasn't been provisioned yet -- the caller (typically scan)
-/// should treat the folder as having no local files this cycle.
-///
-/// Differs from `ensure_maildir` in not creating anything: the
-/// dry-run / pre-`CreateLocalMailbox` path needs to inspect the
-/// filesystem without leaving side effects. `cur/` is the
-/// load-bearing subdir for the scan walk; a bare directory
-/// (no `cur/`) isn't a maildir even if it happens to exist,
-/// and walking it would fail downstream at `read_dir(cur/)`.
+/// Non-creating handle for either full or partial Maildir shape. A missing
+/// peer is not an absent folder. Authoritative enumeration must use entries::read
+/// so an unreadable present peer is not silently treated as empty.
 pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
-    if path.join("cur").is_dir() {
+    if is_maildir(path) {
         Some(Maildir::from(path.to_path_buf()))
     } else {
         None
@@ -41,10 +33,8 @@ pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
 /// a maildir on disk," shared by the drift walk and the `present`
 /// predicate so they can't drift apart.
 ///
-/// Distinct from `try_open_maildir`, which is the stricter
-/// "ready to enumerate" check: walking a maildir reads `cur/`, so a
-/// `new/`-only folder must be healed (its `cur/` recreated) before it
-/// can be opened.
+/// This is a presence predicate, not proof that present peers can be read.
+/// entries::read performs that validation without healing directories.
 pub fn is_maildir(path: &Path) -> bool {
     path.join("cur").is_dir() || path.join("new").is_dir()
 }
@@ -174,9 +164,9 @@ pub fn set_flags_if_unchanged(
     flags: &str,
 ) -> Result<()> {
     let mut found = Vec::new();
-    for entry in maildir.list_cur().chain(maildir.list_new()) {
+    for entry in entries::read(maildir.path())? {
         let entry = entry?;
-        if entry.id() == id && entry.path().is_file() {
+        if entry.maildir_id.as_ref() == id && entry.path.is_file() {
             found.push(entry);
         }
     }
@@ -184,15 +174,11 @@ pub fn set_flags_if_unchanged(
         anyhow::bail!("Expected one local path for {id}, found {}", found.len());
     }
     let entry = found.pop().unwrap();
-    if entry.flags() != expected {
+    if entry.flags != expected {
         anyhow::bail!("Local flags for {id} changed since observation; replanning required");
     }
-    let source = entry.path();
-    let in_new = source
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "new");
-    let subdir = if in_new && !flags.contains('S') {
+    let source = &entry.path;
+    let subdir = if entry.in_new && !flags.contains('S') {
         "new"
     } else {
         "cur"
@@ -205,6 +191,7 @@ pub fn set_flags_if_unchanged(
                 target.display()
             );
         }
+        ensure_message_subdir(target.parent().unwrap())?;
         std::fs::rename(source, &target)
             .with_context(|| format!("Failed to apply flag snapshot for {id}"))?;
         #[cfg(unix)]
@@ -247,10 +234,9 @@ pub fn message_is_in_new(maildir: &Maildir, id: &str) -> bool {
 /// `apply_update_local_flags`'s warn-and-skip path; the next sync
 /// cycle catches up.
 pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
-    let entry = maildir
-        .list_new()
+    let entry = entries::read(maildir.path())?
         .find_map(|e| match e {
-            Ok(entry) if entry.id() == id => Some(Ok(entry)),
+            Ok(entry) if entry.in_new && entry.maildir_id.as_ref() == id => Some(Ok(entry)),
             Ok(_) => None,
             Err(e) => Some(Err(e)),
         })
@@ -263,7 +249,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
                 maildir.path().display()
             )
         })?;
-    let src = entry.path().clone();
+    let src = entry.path;
     let dest = maildir.path().join("cur").join(format!("{id}:2,{flags}"));
     if dest.exists() {
         return Err(anyhow::anyhow!(
@@ -274,6 +260,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
             dest.display()
         ));
     }
+    ensure_message_subdir(dest.parent().unwrap())?;
     std::fs::rename(&src, &dest).with_context(|| {
         format!(
             "Failed to promote {} from new/ to cur/ at {}",
@@ -297,9 +284,9 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
 /// not atomic exclusion against arbitrary concurrent MUA writers.
 pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
     let mut found = Vec::new();
-    for entry in from.list_cur().chain(from.list_new()) {
+    for entry in entries::read(from.path())? {
         let entry = entry?;
-        if entry.id() == id && entry.path().is_file() {
+        if entry.maildir_id.as_ref() == id && entry.path.is_file() {
             found.push(entry);
         }
     }
@@ -309,8 +296,8 @@ pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
         found.len()
     );
     let entry = found.pop().unwrap();
-    let flags = entry.flags().to_owned();
-    let source = entry.path();
+    let flags = entry.flags.clone();
+    let source = &entry.path;
     let filename = source.file_name().context("Move source has no filename")?;
     let target = to.path().join("cur").join(filename);
     anyhow::ensure!(
@@ -318,12 +305,13 @@ pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
         "Refusing existing move target {}",
         target.display()
     );
-    for entry in to.list_cur().chain(to.list_new()) {
+    for entry in entries::read(to.path())? {
         anyhow::ensure!(
-            entry?.id() != id,
+            entry?.maildir_id.as_ref() != id,
             "Move target already contains identity {id}"
         );
     }
+    ensure_message_subdir(target.parent().unwrap())?;
     std::fs::rename(source, &target).with_context(|| format!("Failed to move message {id}"))?;
     #[cfg(unix)]
     {
@@ -333,6 +321,22 @@ pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
     event!(target: TARGET_FILE_OP, Level::TRACE, op = "move");
     debug!("Moved message {} to {:?}", id, to.path());
     Ok(flags)
+}
+
+/// Only a real message write may provision its destination leaf. Do not use
+/// create_dir_all: a concurrently vanished mailbox must not be recreated.
+fn ensure_message_subdir(path: &Path) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            std::fs::File::open(path.parent().context("Message destination has no parent")?)?
+                .sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Cannot create message destination {}", path.display())),
+    }
 }
 
 #[cfg(test)]

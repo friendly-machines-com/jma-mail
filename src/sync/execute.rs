@@ -2193,8 +2193,8 @@ fn apply_update_local_flags(
             message_id,
         } = id;
         let maildir_path = maildir_root.join(&binding.maildir_folder);
-        // Flag effects never provision a missing mailbox. A vanished/partial
-        // source must fail snapshot validation without creating directories.
+        // Flag effects never provision a missing mailbox. A live partial
+        // source is readable; only an actual rename may create its target peer.
         let maildir = maildir::Maildir::from(maildir_path.clone());
         // Persist the generation before the filesystem effect, separately
         // from its acknowledgement. Never overwrite a newer filename edit.

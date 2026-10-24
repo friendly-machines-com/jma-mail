@@ -369,23 +369,20 @@ pub fn scan_folder(
     known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<ScanResult> {
     let mut cur_entries = Vec::new();
-    for entry in maildir.list_cur() {
-        let entry = entry?;
-        cur_entries.push(FileEntry {
-            maildir_id: MaildirId::from(entry.id()),
-            flags: entry.flags().to_string(),
-            path: entry.path().to_path_buf(),
-        });
-    }
-
     let mut new_entries = Vec::new();
-    for entry in maildir.list_new() {
+    for entry in crate::maildir_ops::entries::read(maildir.path())? {
         let entry = entry?;
-        new_entries.push(FileEntry {
-            maildir_id: MaildirId::from(entry.id()),
-            flags: entry.flags().to_string(),
-            path: entry.path().to_path_buf(),
-        });
+        let in_new = entry.in_new;
+        let file = FileEntry {
+            maildir_id: entry.maildir_id,
+            flags: entry.flags,
+            path: entry.path,
+        };
+        if in_new {
+            new_entries.push(file);
+        } else {
+            cur_entries.push(file);
+        }
     }
 
     // The pinned Maildir dependency exposes suffixes in both directories.
