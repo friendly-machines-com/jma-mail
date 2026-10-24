@@ -94,8 +94,9 @@ ordinary mutating commands (`sync`, `pull`, `push`, `watch`) automatically
 recreate it and start a full reconciliation, losing the old history. Back up
 before an upgrade/downgrade that may do this. Read-only commands (`status`,
 `mailboxes`, `auth rediscover`) refuse a mismatch so a concurrent mutator does
-not lose its open DB. `repair-flags` also refuses: rebuilding is not its repair
-mechanism.
+not lose its open DB. `repair-flags` and every `janitor` task also refuse:
+maintenance must preserve the bindings/history used by its safety checks.
+Compatible additive cache updates still run under the normal locks.
 
 ### Concurrency: One Mutator at a Time
 
@@ -369,7 +370,34 @@ using the opposite global policy. Exit status is nonzero for incomplete apply.
 
 ### janitor : Maintenance tasks
 
-`janitor` groups offline maintenance tasks that operate on the maildir tree and state DB outside a sync cycle: `dedupe` (remove per-folder Message-ID duplicates), `remotededupe` (server-side dedupe via `Email/set`), `rebindfolders` (rebind sentinel-less maildirs by Message-ID probing), and `prune` (below). Each takes the same maildir and state-DB locks a sync does, so it won't run concurrently with one.
+`janitor` groups maintenance outside a sync cycle. Every task takes the normal
+maildir and state-DB locks and refuses incompatible history rather than
+rebuilding it, including during preview.
+
+- `dedupe` removes only byte-identical same-folder copies after content
+  verification, never a DB-tracked filename. Same-Message-ID content variants
+  stay on disk; the header alone is not a digest.
+- `remotededupe` verifies remote duplicate groups before `Email/set` destruction.
+  `--details` shows per-member IDs, size, subject, received date and SHA-256.
+  `--content-preview[=BYTES]` implies details and adds terminal-safe raw content
+  (default 16 KiB, maximum 1 MiB per message). Audit downloads do not relax
+  deletion eligibility. Multiple locally bound members are preserved. Apply
+  still requires `--yes`.
+- `rebindfolders` probes Message-IDs to rebind sentinel-less folders.
+- `destroyids` previews an **externally reviewed, account-wide** exact ID list:
+
+  ```sh
+  jma janitor destroyids --config /path/to/config.toml --from reviewed-ids.txt
+  # Add --yes only after reviewing the verified plan.
+  ```
+
+  The file has one JMAP Email ID per line; blank lines and `#` comments are
+  ignored. Duplicate/multi-token lines are errors. Any message_map binding
+  refuses the entire batch before network mutation. Already-absent IDs are
+  tolerated; incomplete apply exits nonzero. This is not a mailbox-selection
+  heuristic or flag repair, and it does not authorize deleting locally mapped
+  messages.
+- `prune` remediates the drift described below.
 
 #### janitor prune : Clear maildir/DB drift
 

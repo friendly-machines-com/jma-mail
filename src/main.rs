@@ -629,7 +629,7 @@ async fn cmd_repair_flags(
     // Serialize the preview as well as apply against cooperating jma mutators.
     // Unlike ordinary sync, never recreate a mismatched history database.
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
     let client = Arc::new(session::connect(&config.account, &conn).await?);
     let ids: Vec<_> = email_ids.into_iter().map(Into::into).collect();
     let preview =
@@ -790,7 +790,7 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
 async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     // Offline path: enumerate folders from the DB's mailbox_map
     // instead of going through JMAP. Janitor work shouldn't
@@ -849,7 +849,7 @@ async fn cmd_janitor_remotededupe(
     // without communicating to the operator that the conflict is
     // total. The honest posture is "this and sync don't co-exist."
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     // Resolve --mailbox (if given) against the synced set so we
     // never query a folder the user has no local mapping for; the
@@ -946,7 +946,7 @@ async fn cmd_janitor_destroyids(cli: &Cli, from: std::path::PathBuf, yes: bool) 
 
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     let contents = std::fs::read_to_string(&from)
         .with_context(|| format!("Failed to read exact destroy manifest {}", from.display()))?;
@@ -1080,7 +1080,7 @@ async fn cmd_janitor_rebindfolders(
     // network and can write sentinels, so the honest stance is
     // "this does not co-exist with sync." Acquire both.
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     let client = session::connect(&config.account, &conn).await?;
     let maildir_root = config.canonical_maildir_root()?;
@@ -1179,7 +1179,7 @@ fn cmd_janitor_prune(
 
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
     let maildir_root = config.canonical_maildir_root()?;
 
     let mut plan = prune::plan(

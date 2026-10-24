@@ -19,6 +19,7 @@ use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod generation;
+mod import_integration;
 mod maildir_cases;
 mod partial;
 mod pull_ack;

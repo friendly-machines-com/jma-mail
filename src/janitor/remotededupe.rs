@@ -121,6 +121,9 @@ impl RemoteDedupeReportOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
+    /// Distinct local Maildir bindings legitimately share a Message-ID. A
+    /// uniqueness constraint on Maildir IDs does not make either disposable.
+    MultipleLocalBindings,
     /// Members carry the same `Message-ID` header but the server
     /// reports different `size` values. Different sizes prove
     /// different bytes, so the group fails the cheap pre-check
@@ -512,6 +515,20 @@ fn classify_group(
     if members.len() < 2 {
         return Classification::Single;
     }
+    if members
+        .iter()
+        .filter(|member| locally_bound.contains(&member.email_id))
+        .take(2)
+        .count()
+        > 1
+    {
+        return Classification::Skipped(RemoteDedupeSkippedGroup {
+            mailbox_folder: mailbox_folder.to_string(),
+            message_id: message_id.clone(),
+            reason: SkipReason::MultipleLocalBindings,
+            members: members.into_iter().map(RemoteDedupeMember::from).collect(),
+        });
+    }
     let sizes: HashSet<u64> = members.iter().map(|m| m.size).collect();
     if sizes.len() != 1 {
         return Classification::Skipped(RemoteDedupeSkippedGroup {
@@ -521,26 +538,6 @@ fn classify_group(
             members: members.into_iter().map(RemoteDedupeMember::from).collect(),
         });
     }
-    // At most one member of a same-Message-ID group can carry a
-    // non-NULL `message_map.maildir_id` at the time we run: the
-    // partial-unique index forbids two such rows from coexisting,
-    // and a steady-state sync (with its Phase 0 dedupe + the
-    // downstream DestroyRemote it emits) collapses any
-    // multi-local-file dupes before they leave the cycle. If this
-    // ever trips, the schema invariant has slipped and we want to
-    // know loudly rather than silently picking a survivor that
-    // orphans the loser's local file.
-    debug_assert!(
-        members
-            .iter()
-            .filter(|m| locally_bound.contains(&m.email_id))
-            .count()
-            <= 1,
-        "More than one Message-ID group member is locally bound -- \
-         partial-unique index on message_map(maildir_id) should make this \
-         impossible. Group members: {:?}",
-        members,
-    );
     let mut sorted = members;
     sorted.sort_by(|a, b| a.email_id.as_ref().cmp(b.email_id.as_ref()));
     // Prefer the locally-bound member as survivor so destroying the

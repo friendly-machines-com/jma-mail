@@ -56,10 +56,10 @@ pub struct LocalEntry {
 }
 
 /// In-memory index of `Message-ID -> [location]` built from the maildir at
-/// dedupe time. A single Message-ID can have one entry per folder (the same
-/// message copied into multiple mailboxes is a legitimate user action, not a
-/// duplicate). Used by the pull path to skip re-downloading messages we
-/// already have on disk even when the state DB has been wiped.
+/// dedupe time. Content-distinct same-folder variants and cross-folder copies
+/// can contribute multiple entries. This bridges cold/partial bootstrap and
+/// selects a canonical upload representative; it does not replace live cached
+/// bindings or prove byte identity from a Message-ID alone.
 #[derive(Debug, Default)]
 pub struct LocalIndex {
     pub by_message_id: HashMap<MessageId, Vec<LocalEntry>>,

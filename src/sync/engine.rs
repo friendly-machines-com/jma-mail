@@ -378,6 +378,22 @@ impl<'a> SyncEngine<'a> {
             scan_scope = ScanScope::Full;
         }
         let maildir_root = self.config.canonical_maildir_root()?;
+        if let ScanScope::Paths(paths) = &scan_scope
+            && paths_need_full_identity_scan(
+                self.conn,
+                &maildir_root,
+                &mailboxes,
+                paths,
+                self.config
+                    .sync
+                    .allow_destructive_folder_sync
+                    .allows_delete_local(),
+            )?
+        {
+            // Decide before Phase 0: new/relocated identities need the full
+            // dedupe/LocalIndex bridge, not only a widened post-dedupe scan.
+            scan_scope = ScanScope::Full;
+        }
 
         // Push-only on a fresh config has nothing local to upload:
         // CreateLocalMailbox actions would be dropped by the
@@ -406,19 +422,10 @@ impl<'a> SyncEngine<'a> {
             }
         }
 
-        // Phase 0: classify duplicates and (conditionally) index. Always
-        // before scan so newly-introduced duplicates from a prior aborted
-        // run don't get treated as local changes to push.
-        //
-        // Reconcile only consults `LocalIndex` when its DB-derived
-        // lookup misses (initial sync, post-`c7a86e6`-recovery wipe, or
-        // any other state where `message_map` is empty). In steady
-        // state every remote Message-ID resolves through the DB, the
-        // index is allocated and never read. Skip the build entirely
-        // when the DB has rows: plan_dedupe still runs (cheap pure
-        // walk), `local_index` stays at default-empty, and
-        // Empty-HashMap lookups return None -- which is exactly what
-        // the existing reconcile stage-2 check already handles.
+        // Phase 0: classify byte-identical duplicates and index every kept
+        // content representative before scanning for changes. A partially
+        // committed bootstrap can have bindings and unbound files together;
+        // a nonempty message_map does not make LocalIndex unnecessary.
         //
         // Plan now, apply later: `apply_dedupe` only runs on non-dry
         // cycles, so `jma sync --dry-run` no longer destroys local
@@ -428,27 +435,19 @@ impl<'a> SyncEngine<'a> {
         // of the duplicates so reconcile sees the post-dedupe shape
         // even under dry-run.
         //
-        // Path-scoped cycles skip the dedupe walk entirely. The walk
-        // is folder-wide -- it parses Message-IDs out of every cur/
-        // and new/ file across every synced folder -- so its cost
-        // doesn't shrink when the trigger only touches a handful of
-        // paths. Paths-scope only fires from the daemon's LocalChange
-        // triggers, where (a) the DB always has rows (Initial seeded
-        // it via Full), so the LocalIndex bridge is unused; (b)
-        // dry-run never applies (the daemon never runs dry); and (c)
-        // any duplicate the cycle misses is caught by the next
-        // Full-scope trigger (SSE pulse, Initial, CLI sync), which
-        // arrives soon on a connected daemon.
+        // Known-ID flag-only Paths cycles still skip the folder-wide walk.
+        // New/relocated identities were widened to Full above so canonical
+        // content siblings and existing live anchors are visible now, without
+        // requiring a later unrelated event to trigger a full scan.
         //
         // Within a Full cycle, the walk is further narrowed against
         // `folder_checkpoint`: any folder whose current (cur_mtime,
         // new_mtime, cur_count, new_count) snapshot matches the row
         // written at the tail of the last successful cycle cannot
         // have grown a per-folder Message-ID duplicate since then.
-        // mtime advances on any add, remove, or in-place rename;
-        // count advances only on add/remove. Requiring both to match
-        // means an in-place rename (the common MUA flag-flip path)
-        // is correctly recognised as not-dupe-inducing. A missing
+        // mtime catches renames/replacements even when counts stay equal;
+        // counts catch additions/removals. Only exact snapshot agreement
+        // skips the walk; rename-only churn is conservatively dirty. A missing
         // checkpoint row (first sync, post-recovery wipe, freshly
         // added folder) is treated as dirty, so the LocalIndex
         // bridge still gets populated on first sync.
@@ -1759,6 +1758,47 @@ fn defer_ambiguous_deletes(
         count: deferred.len(),
         folders,
     })
+}
+
+/// Keep ordinary flag renames path-scoped, but inventory new identities before
+/// adoption/upload planning. A partial filename map cannot prove that a cached
+/// anchor is absent, and without Phase 0 it has no canonical content siblings.
+fn paths_need_full_identity_scan(
+    conn: &Connection,
+    root: &Path,
+    mailboxes: &MailboxBindings,
+    paths: &[PathBuf],
+    include_orphans: bool,
+) -> Result<bool> {
+    let bindings = mailboxes.scan_set(include_orphans);
+    let managed: HashSet<_> = bindings
+        .iter()
+        .map(|binding| binding.maildir_folder.as_str())
+        .collect();
+    let mut live = HashSet::new();
+    let mut disappeared = HashSet::new();
+    for path in paths {
+        let Some((folder, side, id, _)) = scan::parse_event_path(root, path) else {
+            continue;
+        };
+        if !managed.contains(folder.as_str()) || id.as_ref().starts_with('.') {
+            continue;
+        }
+        let present = path.is_file();
+        let recorded = queries::get_local_state(conn, &id)?;
+        if present {
+            live.insert((folder.clone(), id.clone()));
+        }
+        match recorded {
+            Some((previous, _)) if present && previous != folder => return Ok(true),
+            None if present && side == "cur" => return Ok(true),
+            Some((previous, _)) if !present && previous == folder => {
+                disappeared.insert((folder, id));
+            }
+            _ => {}
+        }
+    }
+    Ok(disappeared.iter().any(|identity| !live.contains(identity)))
 }
 
 fn flag_mailbox_ids(mailboxes: &MailboxBindings) -> Vec<JmapMailboxId> {

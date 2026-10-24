@@ -146,7 +146,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **JMAP-side types** (`src/jmap/types.rs`). Hand-rolled rather than re-exported from `jmap-client` so the rest of the codebase doesn't depend on the upstream crate's shape.
 
-- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<JmapMailboxId, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<MessageId>>, subject }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
+- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<JmapMailboxId, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<MessageId>>, subject, received_at: Option<i64>, size }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
 - `ChangesResponse` -- `{ old_state, new_state, created, updated, destroyed, has_more_changes }`. The shape `Email/changes` returns; loop control for `fetch_remote_state`.
 - `SessionInfo` -- session URLs and account id, captured at connect time.
 
@@ -185,13 +185,63 @@ Two distinct identifiers anchor the system:
 
 The state DB is **rebuildable, not a lossless journal**. Recreating it starts a new reconciliation from the current maildir and server state. Message-ID-based adoption is intended to reuse existing files rather than download another copy; it cannot reconstruct the history of changes made before the reset. The current recovery mechanisms are:
 
-1. `sync::dedupe::plan_dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and classifies the newest by mtime within each group as a duplicate. Newer copies are presumed to be jma-introduced duplicates from a prior aborted run. Groups containing a cross-subdir pair (one candidate in `cur/`, one in `new/`) whose qmail unique ids are in an extending-prefix relationship are exempt from deletion -- every realistic MUA preserves the unique across `rename(2)` promotion, and mbsync additionally appends `,U=<imap-uid>` to it, so such a pair is the signature of a `rename(2)` we observed across two separate readdirs rather than two distinct duplicates. The pair stays on disk, `plan.kept` still emits an entry for `LocalIndex`, and the cycle after the promotion's caller settles the pair collapses to in-subdir and gets cleaned then. Cross-subdir pairs with unrelated uniques are *not* exempt -- those are real duplicates (e.g., jma re-delivered into `new/` while a different copy already lived in `cur/`) and get normal mtime-based dedupe. Returns a `DedupePlan { kept, deletions }` without touching disk; `SyncEngine::run` uses `plan.kept` to build a `LocalIndex` keyed on Message-ID and calls `sync::dedupe::apply_dedupe` to **delete** the planned duplicates on non-dry-run cycles only. Under `--dry-run` the deletions are surfaced in the printed plan instead of executed.
+1. `sync::dedupe::plan_dedupe` groups files by Message-ID, then partitions
+   each group by complete content. Size/SHA-256 are prefilters followed by a
+   byte-for-byte comparison; the oldest mtime survives within each identical
+   class. Content-distinct revisions remain on disk and each contributes a
+   KeptEntry. Cross-folder copies stay separate, and extending-prefix cur/new
+   promotion pairs retain their existing exemption. The plan is non-mutating.
+   `janitor::dedupe::run` additionally vetoes deletion of any ID in
+   `message_map` or `local_state`, preserving live synchronization anchors even
+   when byte-identical. Only remaining deletions run on apply; previews do not
+   delete files.
 
-2. `reconcile` consults `message_map` (by JMAP id) -> `LocalIndex` (by Message-ID) before emitting a `DownloadMessage`. The Message-ID lookup is what saves us after a DB wipe: a known server email whose Message-ID we already have on disk is adopted into `message_map` rather than re-downloaded.
+2. Reconcile consults bindings and LocalIndex before downloading. The index
+   is built from dedupe-kept entries even when message_map is nonempty, so
+   partially committed bootstraps can still discover their unbound files.
+   Checkpoints narrow the walk; it is not a permanent whole-tree index. One
+   oldest local content representative per Message-ID/folder may upload;
+   siblings remain locally for review rather than competing for Fastmail's
+   one-import-per-Message-ID rule. Message-ID-based adoption reuses supported,
+   unambiguous matches; it is not proof of byte identity or lost-history recovery.
 
 3. **Both ingest boundaries refuse Message-ID-less messages.** Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `sync::dedupe::plan_dedupe`. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. The result: no row enters `message_map`, and no `LocalChange::NewMessage` is emitted, without an anchor.
 
 Don't add a code path that writes to a maildir outside `Executor::execute` (or `apply_dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
+
+### PR #21 integration and live-binding authority
+
+Content-safe dedupe preserves more copies; that does not authorize adopting an
+untracked copy over a still-live cached Maildir ID or treating its suffix as a
+new edit of the bound message. Same-folder adoption first prefers an exact
+Maildir-ID binding, preserves extra copies when an anchor is live, and defers
+multiple unbound candidates when the old anchor is missing. Remote dedupe
+likewise refuses a group with multiple locally bound Email IDs: uniqueness of
+Maildir IDs does not imply uniqueness of Message-ID. These cases preserve
+both files/objects and their flag histories instead of guessing or panicking.
+
+Path cycles preflight new/relocated identities and disappeared known identities
+before Phase 0. They widen to Full so dedupe and LocalIndex participate as well
+as the scan. Ordinary known-ID flag renames remain path-scoped; unknown new-side
+files remain observation-only. Missing unknown paths and excluded paths do not widen merely
+because their filenames are unfamiliar. The older post-scan deletion
+widening remains a conservative race-window fallback.
+
+Permanent per-message import rejections alreadyExists/invalidEmail are detected
+through the anyhow source chain, not outer Display text, and preserve the
+local file without recording an upload. Account/transport/protocol failures
+still propagate. Skipped files may be reassessed on later Full cycles; this is
+not a durable body-payload retry or suppression queue.
+
+Remote-dedupe audit options retain member subject/receivedAt, size, SHA-256 and
+an optional bounded terminal-safe content prefix. Reporting never promotes a
+refused group into deletion eligibility. Email/get requests subject and
+receivedAt (optional Unix seconds) for that report; they are observations, not
+flag acknowledgement history. `janitor destroyids` accepts an externally
+reviewed, account-wide exact ID manifest, refuses the entire batch if any ID
+has a message_map row, verifies fresh presence and requires --yes to destroy.
+Explicit maintenance uses its existing unconditioned Email/set path; normal
+reconciliation still requires its planning-state guard.
 
 ### Schema versioning: nuke-and-resync as the migration story
 
@@ -201,9 +251,10 @@ On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
 - **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` logs a warning and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. There is no confirmation prompt or automatic backup. The caller is required to hold the state DB lock, preventing another cooperating jma from using the DB during the unlink. This lock prevents that race; it does not make discarding synchronization history lossless.
-- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jma sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
+- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with backup/rebuild guidance. Read-only paths don't hold the state DB lock and cannot safely unlink it.
+- **Maintenance and targeted repair** -- `open_preserving_history` refuses a mismatch even while holding the locks. Compatible additive migrations run, but binding/history rows are never discarded before dedupe, reviewed-destroy or repair preflight. This includes previews. Ordinary sync/pull/push/watch rebuild policy is unchanged.
 
-Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
+Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path for ordinary sync mutators. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
 
 When you bump `SCHEMA_VERSION`, the current implementation rebuilds rather than migrates. Mention the field/invariant change and the recovery consequences in the commit message, and test the old-schema open path. Do not infer that every future state addition can safely be discarded merely because the current open path does so.
 
@@ -389,8 +440,8 @@ receipt ambiguity and partial-chunk acknowledgement rules still apply. CLI
 incomplete apply returns nonzero; it does not automatically replay stale input.
 
 The command takes maildir then DB locks for preview and apply and requires an
-existing DB, using `db::open`, never `open_or_recreate`. Standard schema
-initialization and session discovery-cache writes still apply; preview's
+existing DB, using `db::open_preserving_history`, never `open_or_recreate`.
+Compatible additive migrations and session discovery-cache writes still apply; preview's
 SELECT-only guarantee concerns repair observations/history, not those existing
 open/connect behaviors or the lock files. It does not fix folder identity or
 recreate missing directories. A DB rebuild still discards flag history.

@@ -114,6 +114,7 @@ struct ReconcileCtx<'a> {
     /// record's `flags` column.
     local_flags: &'a HashMap<MaildirId, String>,
     local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
+    local_new_candidates: HashMap<(&'a MessageId, &'a str), usize>,
     local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
     max_upload_size: usize,
@@ -257,6 +258,19 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         })
         .collect();
 
+    let mut local_new_candidates = HashMap::new();
+    for change in local_changes {
+        if let LocalChange::NewMessage {
+            message_id,
+            binding,
+            ..
+        } = change
+        {
+            *local_new_candidates
+                .entry((message_id, binding.maildir_folder.as_str()))
+                .or_insert(0) += 1;
+        }
+    }
     let mut detected_moves: Vec<DetectedMove> = Vec::new();
     let mut consumed_news: HashSet<MaildirId> = HashSet::new();
     let mut consumed_deletes: HashSet<JmapEmailId> = HashSet::new();
@@ -336,6 +350,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         local_index,
         local_flags,
         local_flag_changes,
+        local_new_candidates,
         local_deletes,
         destroyed_set,
         max_upload_size,
@@ -2068,8 +2083,43 @@ fn handle_local_new(
     // email (DB index), adopt instead of upload. This is the
     // alreadyExists guard.
     if let Some(recs) = ctx.known_by_message_id.get(message_id)
-        && let Some(rec) = recs.iter().find(|r| r.jmap_mailbox_id == mailbox_id)
+        && let Some(rec) = recs
+            .iter()
+            .find(|r| r.jmap_mailbox_id == mailbox_id && r.maildir_id.as_ref() == Some(maildir_id))
+            .or_else(|| recs.iter().find(|r| r.jmap_mailbox_id == mailbox_id))
     {
+        if rec.maildir_id.as_ref() != Some(maildir_id) {
+            if recs
+                .iter()
+                .filter(|record| record.jmap_mailbox_id == mailbox_id)
+                .any(|record| {
+                    record
+                        .maildir_id
+                        .as_ref()
+                        .is_some_and(|id| ctx.local_flags.contains_key(id))
+                })
+            {
+                warn!(
+                    "Preserving untracked same-Message-ID copy {}/{} without replacing a live bound identity or its flags",
+                    folder, maildir_id
+                );
+                return;
+            }
+            if ctx
+                .local_new_candidates
+                .get(&(message_id, folder))
+                .copied()
+                .unwrap_or(0)
+                > 1
+            {
+                plan.actions.push(SyncAction::DeferredFlagState {
+                    id: RemoteId { jmap_email_id: rec.jmap_email_id.clone(), message_id: message_id.clone() },
+                    reason: "Multiple unbound content candidates cannot replace a missing cached identity without review".into(),
+                    retryable: false,
+                });
+                return;
+            }
+        }
         let bound_id = BoundId {
             maildir_id: maildir_id.clone(),
             jmap_email_id: rec.jmap_email_id.clone(),
@@ -2639,16 +2689,38 @@ mod tests {
         local_flags: &HashMap<MaildirId, String>,
         strategy: ConflictStrategy,
     ) -> SyncPlan {
+        let local_flags = observed_flags(records, local_changes, local_flags);
+        run_with_inventory(
+            remote_emails,
+            remote_destroyed,
+            local_changes,
+            records,
+            local_index,
+            &local_flags,
+            strategy,
+        )
+    }
+
+    /// Actual inventory, without seeding cached IDs as live paths. Recovery
+    /// tests use this when the cached old filename is no longer on disk.
+    fn run_with_inventory(
+        remote_emails: &[EmailObject],
+        remote_destroyed: &[JmapEmailId],
+        local_changes: &[LocalChange],
+        records: &[MessageRecord],
+        local_index: &LocalIndex,
+        local_flags: &HashMap<MaildirId, String>,
+        strategy: ConflictStrategy,
+    ) -> SyncPlan {
         let known = indices(records);
         let mailboxes = mailboxes();
-        let local_flags = observed_flags(records, local_changes, local_flags);
         reconcile(ReconcileInput {
             remote_emails,
             remote_destroyed,
             local_changes,
             known: &known,
             local_index,
-            local_flags: &local_flags,
+            local_flags,
             mailboxes: &mailboxes,
             policy: SyncPolicy {
                 conflict_strategy: strategy,
@@ -3277,12 +3349,15 @@ mod tests {
             message_id: "a@x".into(),
             size_bytes: 0,
         };
-        let plan = run(
+        // Only M-NEW is observed. The cached M-EXISTING is absent, not a
+        // second live copy from which this file may steal flag authority.
+        let plan = run_with_inventory(
             &[],
             &[],
             &[new_change],
             &[rec],
             &empty_index(),
+            &HashMap::from([("M-NEW".into(), "FS".into())]),
             ConflictStrategy::ServerWins,
         );
         assert_eq!(plan.adopt_count(), 1);
@@ -3326,12 +3401,15 @@ mod tests {
             message_id: "a@x".into(),
             size_bytes: 0,
         };
-        let plan = run(
+        // This is a missing cached filename being recovered, not an extra
+        // untracked file beside a still-live binding.
+        let plan = run_with_inventory(
             std::slice::from_ref(&fresh),
             &[],
             &[new_change],
             &[rec],
             &empty_index(),
+            &HashMap::from([("M-NEW".into(), "S".into())]),
             ConflictStrategy::LocalWins,
         );
         let adopt = plan

@@ -818,7 +818,7 @@ fn walk_for_maildir_dirs_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
 /// suffix-bearing shape to `new/` for non-Seen flag preservation;
 /// see `store_message`). Both shapes split on the first `:2,`, with
 /// no-`:2,` interpreted as empty flags.
-fn parse_event_path(
+pub(crate) fn parse_event_path(
     maildir_root: &Path,
     path: &Path,
 ) -> Option<(String, String, MaildirId, String)> {
