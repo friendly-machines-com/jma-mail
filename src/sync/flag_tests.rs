@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+mod generation;
+
 const ACCOUNT_ID: &str = "u-test-account";
 const SESSION_STATE: &str = "session-1";
 
@@ -33,6 +35,17 @@ struct ServerState {
     email_state: String,
     blobs: HashMap<String, Vec<u8>>,
     set_requests: Vec<Value>,
+    set_results: Vec<Value>,
+    state_mismatches: usize,
+    edit_before_set: Option<RemoteEdit>,
+    edit_before_set_at: usize,
+    edit_before_set_remaining: usize,
+    edit_other_before_set: bool,
+    edit_after_metadata_get: Option<RemoteEdit>,
+    omit_set_new_state_on: Option<usize>,
+    rename_before_set: Option<(PathBuf, PathBuf)>,
+    rename_many_before_set: Vec<(PathBuf, PathBuf)>,
+    rename_many_after_set: Vec<(PathBuf, PathBuf)>,
     blob_requests: usize,
     email_changes_requests: usize,
     email_changes_failures: usize,
@@ -41,6 +54,7 @@ struct ServerState {
     reject_update_type: Option<String>,
     reject_updates: HashMap<String, (usize, String)>,
     http_failures: usize,
+    set_method_failures: usize,
     lost_replies: usize,
     omitted_acknowledgements: usize,
     rename_after_set: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -81,6 +95,46 @@ struct ServerState {
     /// `mailbox_set_destroys` / does not remove the mailbox.
     /// Pins the warn-and-continue path.
     mailbox_set_reject_destroy_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RemoteEdit {
+    id: Option<String>,
+    flags: String,
+    keyword_prefix: &'static str,
+}
+
+fn apply_remote_edit(state: &mut ServerState, edit: RemoteEdit, fallback_id: Option<&str>) {
+    let id = edit
+        .id
+        .as_deref()
+        .or(fallback_id)
+        .expect("an actor edit needs an Email ID");
+    let email = state
+        .emails
+        .iter_mut()
+        .find(|email| email.id == id)
+        .unwrap();
+    email.keywords.retain(|key| {
+        ![
+            "$draft",
+            "$flagged",
+            "$forwarded",
+            "$answered",
+            "$seen",
+            "$deleted",
+        ]
+        .contains(&key.as_str())
+    });
+    email
+        .keywords
+        .extend(flags_to_keywords(&edit.flags).into_keys());
+    email.keywords.push(format!(
+        "{}-{}",
+        edit.keyword_prefix,
+        state.set_requests.len()
+    ));
+    advance_email_state(state);
 }
 
 #[derive(Default, Clone)]
@@ -155,10 +209,12 @@ fn session_doc(server_uri: &str) -> Value {
     })
 }
 
-async fn mount_session(server: &MockServer) {
+async fn mount_session(server: &MockServer, max_objects_in_set: u64) {
+    let mut doc = session_doc(&server.uri());
+    doc["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] = json!(max_objects_in_set);
     Mock::given(method("GET"))
         .and(path("/.well-known/jmap"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(session_doc(&server.uri())))
+        .respond_with(ResponseTemplate::new(200).set_body_json(doc))
         .mount(server)
         .await;
 }
@@ -176,7 +232,8 @@ async fn mount_jmap(server: &MockServer, state: Arc<Mutex<ServerState>>) {
                 .as_array()
                 .expect("methodCalls array")
                 .clone();
-            if calls.iter().any(|call| call[0] == "Email/set") {
+            let email_set_request = calls.iter().any(|call| call[0] == "Email/set");
+            if email_set_request {
                 let mut state = state_for_closure.lock().unwrap();
                 state.set_requests.push(body.clone());
                 if state.http_failures > 0 {
@@ -198,7 +255,7 @@ async fn mount_jmap(server: &MockServer, state: Arc<Mutex<ServerState>>) {
                 );
                 responses.push(resp);
             }
-            if responses.iter().any(|response| response[0] == "Email/set") {
+            if email_set_request {
                 let mut state = state_for_closure.lock().unwrap();
                 if state.lost_replies > 0 {
                     state.lost_replies -= 1;
@@ -516,7 +573,11 @@ fn email_get(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
         })
         .cloned()
         .collect();
-    json!([
+    let metadata_id = list
+        .first()
+        .and_then(|email| email["id"].as_str())
+        .map(str::to_owned);
+    let response = json!([
         "Email/get",
         {
             "accountId": ACCOUNT_ID,
@@ -525,7 +586,13 @@ fn email_get(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
             "notFound": not_found
         },
         call_id
-    ])
+    ]);
+    if metadata_id.is_some()
+        && let Some(edit) = state.edit_after_metadata_get.take()
+    {
+        apply_remote_edit(state, edit, metadata_id.as_deref());
+    }
+    response
 }
 
 fn email_changes(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
@@ -738,15 +805,18 @@ async fn flag_inventory_stale_destroy_plan_is_vetoed_at_execution() {
         crate::sync::execute::Executor::new(Arc::new(client), &fixture.conn, &fixture.config, None)
             .unwrap();
     let result = executor
-        .execute(crate::sync::plan::SyncPlan {
-            actions: vec![crate::sync::plan::SyncAction::DestroyRemote {
-                id: crate::sync::plan::RemoteId {
-                    jmap_email_id: "E1".into(),
-                    message_id: "audit@example.com".into(),
-                },
-            }],
-            new_email_state: None,
-        })
+        .execute(
+            crate::sync::plan::SyncPlan {
+                actions: vec![crate::sync::plan::SyncAction::DestroyRemote {
+                    id: crate::sync::plan::RemoteId {
+                        jmap_email_id: "E1".into(),
+                        message_id: "audit@example.com".into(),
+                    },
+                }],
+                new_email_state: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(result.deleted, 0);
@@ -2455,6 +2525,48 @@ fn advance_email_state(state: &mut ServerState) {
 // Independent RFC-style state transition: validate the entire object, then
 // commit it atomically. Omission is not deletion; false is not a keyword value.
 fn email_set(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
+    if state.edit_before_set_remaining > 0
+        && state.set_requests.len() >= state.edit_before_set_at
+        && let Some(edit) = state.edit_before_set.clone()
+    {
+        state.edit_before_set_remaining -= 1;
+        let id = args["update"]
+            .as_object()
+            .and_then(|updates| updates.keys().next())
+            .map(String::as_str)
+            .or_else(|| {
+                args["destroy"]
+                    .as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+            });
+        let id = if state.edit_other_before_set {
+            state
+                .emails
+                .iter()
+                .find(|email| Some(email.id.as_str()) != id)
+                .map(|email| email.id.clone())
+        } else {
+            id.map(str::to_owned)
+        };
+        apply_remote_edit(state, edit, id.as_deref());
+    }
+    for (source, target) in std::mem::take(&mut state.rename_many_before_set) {
+        std::fs::rename(source, target).unwrap();
+    }
+    if let Some((source, target)) = state.rename_before_set.take() {
+        std::fs::rename(source, target).unwrap();
+    }
+    if state.set_method_failures > 0 {
+        state.set_method_failures -= 1;
+        return json!(["error", {"type":"serverFail"}, call_id]);
+    }
+    if let Some(expected) = args["ifInState"].as_str()
+        && expected != state.email_state
+    {
+        state.state_mismatches += 1;
+        return json!(["error", {"type":"stateMismatch"}, call_id]);
+    }
     let old = state.email_state.clone();
     let mut updated = serde_json::Map::new();
     let mut not_updated = serde_json::Map::new();
@@ -2546,13 +2658,23 @@ fn email_set(args: &Value, call_id: &str, state: &mut ServerState) -> Value {
     {
         std::fs::rename(source, target).unwrap();
     }
+    if !updated.is_empty() {
+        for (source, target) in std::mem::take(&mut state.rename_many_after_set) {
+            std::fs::rename(source, target).unwrap();
+        }
+    }
     if state.omitted_acknowledgements > 0 {
         state.omitted_acknowledgements -= 1;
         updated.clear();
         destroyed.clear();
     }
-    json!(["Email/set", {"accountId":ACCOUNT_ID, "oldState":old, "newState":state.email_state,
-        "updated":updated, "notUpdated":not_updated, "destroyed":destroyed, "notDestroyed":not_destroyed}, call_id])
+    let mut response = json!(["Email/set", {"accountId":ACCOUNT_ID, "oldState":old, "newState":state.email_state,
+        "updated":updated, "notUpdated":not_updated, "destroyed":destroyed, "notDestroyed":not_destroyed}, call_id]);
+    if state.omit_set_new_state_on == Some(state.set_requests.len()) {
+        response[1].as_object_mut().unwrap().remove("newState");
+    }
+    state.set_results.push(response.clone());
+    response
 }
 
 struct FlagFixture {
@@ -2566,8 +2688,17 @@ struct FlagFixture {
 
 impl FlagFixture {
     async fn new(flags: &str, custom: bool, strategy: ConflictStrategy) -> Self {
+        Self::new_with_set_limit(flags, custom, strategy, 500).await
+    }
+
+    async fn new_with_set_limit(
+        flags: &str,
+        custom: bool,
+        strategy: ConflictStrategy,
+        max_set: u64,
+    ) -> Self {
         let server = MockServer::start().await;
-        mount_session(&server).await;
+        mount_session(&server, max_set).await;
         let mut keywords: Vec<_> = flags_to_keywords(flags).into_keys().collect();
         if custom {
             keywords.push("keep-me".into());

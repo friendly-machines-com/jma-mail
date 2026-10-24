@@ -322,7 +322,7 @@ async fn check_executor_move(rejected: bool) {
     };
     let outcome = Executor::new(Arc::new(client), &conn, &config, None)
         .unwrap()
-        .execute(plan)
+        .execute(plan, Some("s0"))
         .await
         .unwrap();
     let record = queries::get_message_by_jmap_id(&conn, &"E1".into())

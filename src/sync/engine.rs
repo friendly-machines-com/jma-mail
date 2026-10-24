@@ -99,6 +99,9 @@ pub struct SyncOutcome {
     /// True only after a non-preview, bidirectional full inventory. A Paths
     /// no-op cannot clear a daemon's outstanding retry deadline.
     pub retry_scope_checked: bool,
+    /// Conditional Email/set work needs a new observed generation, never a
+    /// blind retry of the old serialized plan.
+    pub replan_required: bool,
     /// Local changes deferred because the current inventory cannot establish
     /// a safe identity transition. These are not successful synchronization.
     pub deferred_actions: usize,
@@ -131,7 +134,8 @@ pub struct SyncOutcome {
 
 impl SyncOutcome {
     pub fn needs_retry(&self) -> bool {
-        self.pending_flag_actions > self.blocked_flag_actions
+        self.replan_required
+            || self.pending_flag_actions > self.blocked_flag_actions
             || self.retryable_remote_actions > 0
             || self.retryable_local_actions > 0
             || self.retryable_deferred_actions > 0
@@ -144,7 +148,8 @@ impl SyncOutcome {
     }
 
     pub fn has_pending_work(&self) -> bool {
-        self.pending_flag_actions > 0
+        self.replan_required
+            || self.pending_flag_actions > 0
             || self.has_blocked_work()
             || self.unverified_flag_actions > 0
             || self.failed_remote_actions > 0
@@ -172,6 +177,30 @@ impl SyncOutcome {
             self.review_actions
         )
     }
+}
+
+struct CycleRun {
+    outcome: SyncOutcome,
+    used_initial_path: bool,
+    report: bool,
+}
+
+fn cycle_summary(outcome: &SyncOutcome, initial: bool) -> String {
+    if outcome.already_in_sync {
+        return "Already in sync".into();
+    }
+    if outcome.has_pending_work() {
+        return format!("Sync incomplete ({})", outcome.pending_summary());
+    }
+    let label = if initial {
+        "Initial sync complete"
+    } else {
+        "Sync complete"
+    };
+    format!(
+        "{label} ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
+        outcome.downloaded, outcome.uploaded, outcome.flag_updates, outcome.moved, outcome.deleted
+    )
 }
 
 /// Bundles the immutable state every engine helper threads through
@@ -284,6 +313,55 @@ impl<'a> SyncEngine<'a> {
         direction: SyncDirection,
         mut scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
+        const MAX_GENERATION_ATTEMPTS: usize = 3;
+        let mut previous: Option<SyncOutcome> = None;
+        let mut attempt = 0;
+        let mut report = false;
+        let mut initial = false;
+        loop {
+            let cycle = self.run_once(dry_run, direction, scan_scope).await?;
+            report |= cycle.report;
+            initial |= cycle.used_initial_path;
+            let mut outcome = cycle.outcome;
+            if let Some(completed) = previous {
+                outcome.downloaded += completed.downloaded;
+                outcome.uploaded += completed.uploaded;
+                outcome.flag_updates += completed.flag_updates;
+                outcome.moved += completed.moved;
+                outcome.deleted += completed.deleted;
+                outcome.failed_remote_actions += completed.failed_remote_actions;
+                outcome.already_in_sync &= completed.already_in_sync;
+            }
+            attempt += 1;
+            // Explicit per-ID failures keep their normal backoff/permission
+            // handling. Only a snapshot rejection gets an immediate replan.
+            if !outcome.replan_required
+                || outcome.failed_remote_actions > 0
+                || dry_run
+                || attempt >= MAX_GENERATION_ATTEMPTS
+            {
+                if !dry_run && report {
+                    crate::notify!("{}", cycle_summary(&outcome, initial));
+                }
+                return Ok(outcome);
+            }
+            warn!(
+                "Conditional Email/set requires fresh observations; rebuilding the plan ({}/{})",
+                attempt, MAX_GENERATION_ATTEMPTS
+            );
+            scan_scope = ScanScope::Retry {
+                blocked_remote_ids: outcome.blocked_remote_ids.clone(),
+            };
+            previous = Some(outcome);
+        }
+    }
+
+    async fn run_once(
+        &self,
+        dry_run: bool,
+        direction: SyncDirection,
+        mut scan_scope: ScanScope,
+    ) -> Result<CycleRun> {
         let (retry_only, blocked_remote_ids) = match &scan_scope {
             ScanScope::Retry { blocked_remote_ids } => (true, blocked_remote_ids.clone()),
             _ => (false, HashSet::new()),
@@ -628,10 +706,12 @@ impl<'a> SyncEngine<'a> {
             };
             outcome.observe_flag_status(&pending_before);
             outcome.already_in_sync = !outcome.has_pending_work();
-            if outcome.has_pending_work() {
-                crate::notify!("Sync incomplete ({})", outcome.pending_summary());
-            }
-            return Ok(outcome);
+            let report = outcome.has_pending_work();
+            return Ok(CycleRun {
+                outcome,
+                used_initial_path: false,
+                report,
+            });
         }
 
         // Phase 2: collect remote changes.
@@ -695,6 +775,9 @@ impl<'a> SyncEngine<'a> {
             );
         }
 
+        // Keep the observation guard separate from cursor advancement: move
+        // policy or direction gates may deliberately withhold that cursor.
+        let planning_state = new_state.clone();
         // Phase 3: build a pure plan from observations and acknowledged state.
         let mut plan = {
             let _phase =
@@ -792,7 +875,11 @@ impl<'a> SyncEngine<'a> {
                     outcome.pending_summary()
                 );
             }
-            return Ok(outcome);
+            return Ok(CycleRun {
+                outcome,
+                used_initial_path,
+                report: false,
+            });
         }
 
         // An empty plan still has to flow through the executor so the
@@ -845,7 +932,7 @@ impl<'a> SyncEngine<'a> {
             self.self_writes.clone(),
         )?;
         let mut outcome = executor
-            .execute(filtered)
+            .execute(filtered, Some(&planning_state))
             .instrument(tracing::info_span!(
                 target: crate::profile::TARGET_PHASE,
                 "execute",
@@ -932,30 +1019,11 @@ impl<'a> SyncEngine<'a> {
             warn!("Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}");
         }
 
-        if outcome.already_in_sync {
-            crate::notify!("Already in sync");
-        } else if outcome.has_pending_work() {
-            crate::notify!("Sync incomplete ({})", outcome.pending_summary());
-        } else if used_initial_path {
-            crate::notify!(
-                "Initial sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
-                outcome.downloaded,
-                outcome.uploaded,
-                outcome.flag_updates,
-                outcome.moved,
-                outcome.deleted
-            );
-        } else {
-            crate::notify!(
-                "Sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
-                outcome.downloaded,
-                outcome.uploaded,
-                outcome.flag_updates,
-                outcome.moved,
-                outcome.deleted
-            );
-        }
-        Ok(outcome)
+        Ok(CycleRun {
+            outcome,
+            used_initial_path,
+            report: true,
+        })
     }
 
     /// Resolve this cycle's mailbox set and the `Mailbox` state token
@@ -1234,6 +1302,9 @@ impl<'a> SyncEngine<'a> {
         &self,
         mailboxes: &MailboxBindings,
     ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
+        // An after-the-read token could skip an intervening update or authorize
+        // stale metadata. The initial cookie must precede all enumeration/get.
+        let state = jmap_email::get_current_state(&self.client).await?;
         let mut all_ids: Vec<JmapEmailId> = Vec::new();
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
 
@@ -1275,7 +1346,6 @@ impl<'a> SyncEngine<'a> {
         }
 
         let emails = self.batched_get(&all_ids).await?;
-        let state = jmap_email::get_current_state(&self.client).await?;
         Ok((emails, Vec::new(), state, true))
     }
 
@@ -1755,6 +1825,25 @@ fn build_known_indices(
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
     let flag_states = flag_sync::load_for_mailboxes(conn, &flag_mailbox_ids(mailboxes))?;
+    // ServerWins resurrection of a locally deleted folder clears these old
+    // bindings in CreateLocalMailbox before message effects. Plan against that
+    // projected state, not ghost paths which would suppress body restoration.
+    // Different-ID replacements still retain local-orphan history checks.
+    let rebuilt: HashSet<_> = mailboxes
+        .new_mailboxes()
+        .iter()
+        .filter_map(|new| {
+            new.replaces_orphan_id
+                .as_ref()
+                .filter(|old| {
+                    *old == new
+                        .binding
+                        .jmap_mailbox_id
+                        .expect_resolved("rebuilt local mailbox")
+                })
+                .cloned()
+        })
+        .collect();
 
     // Pending flag histories in local orphans must remain visible to the
     // destructive-folder conflict pass too, even without a new local delta.
@@ -1762,6 +1851,9 @@ fn build_known_indices(
         let mailbox_id = binding
             .jmap_mailbox_id
             .expect_resolved("build_known_indices -- scan bindings must be resolved");
+        if rebuilt.contains(mailbox_id) {
+            continue;
+        }
         let messages = queries::get_messages_by_jmap_mailbox_id(conn, mailbox_id)?;
         let local = queries::get_local_state_for_folder(conn, &binding.maildir_folder)?;
         for msg in messages {

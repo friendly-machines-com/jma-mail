@@ -242,9 +242,10 @@ about unclassifiable bound mailboxes. It does not verify remote state or
 acknowledge histories. Existing DB-opening/schema initialization is unchanged.
 
 Full/manual cycles can reassess retained discrepancies. Watch mode also has
-an event-independent retry deadline (see below). Targeted legacy authority
-repair and Email-state preconditions/stateMismatch replanning remain separate
-follow-ups; a timer does not recover discarded DB history.
+an event-independent retry deadline (see below). Email-state preconditions
+and fresh generation replanning are described below; targeted legacy
+authority repair remains separate. Neither a timer nor a conditional write
+recovers discarded DB history.
 Unresolved flag histories hold destructive local-orphan handling, while mere
 metadata observations are not user-change blockers. Moves and adoption use
 the same baseline decision as ordinary updates. A move uses the observed
@@ -265,6 +266,66 @@ destinations are deferred for review rather than arbitrarily counter-moved.
 When folder policy replaces a move with a counter-move, its destination flag
 pull is deferred and the cursor held for a post-counter replan, not allowed
 to escape into the ordinary pre-membership flag phase.
+
+### Email snapshot guards and generation replanning
+
+A reconciliation Email/set is conditioned on the **Email object state for the
+same account**, captured before its remote observations. Incremental cycles
+use the final Email/changes state before Email/get. Initial enumeration now
+captures `get_current_state` **before** query/get, not after: a later cookie
+could both authorize stale metadata and skip an intervening change on the
+next delta cycle. Query-state and session-state strings are not substitutes.
+
+The guard is passed separately to `Executor::execute(plan, planning_state)`.
+`SyncPlan.new_email_state` is a cursor target and may intentionally be None
+for unfinished placement or suppressed work; it must not silently disable
+conditional writes. Actual Email/set without a non-empty planning state is
+refused before its flag receipts or network call. Pure-local/mailbox-only plans and
+execution-time-vetoed destroys need no Email guard. Explicit maintenance and
+independent oracle writes retain the unconditioned `set_email_batch` helper;
+reconciliation uses `set_email_batch_if_in_state`.
+
+Own Email/import state edges advance the guard only if they form a verified
+continuous chain from the planning state. An unrelated/unreachable edge or
+missing chain half cannot authorize the old plan with a newer token. Each
+Email/set chunk carries `ifInState`; a following chunk uses newState only
+when oldState matches its guard and both response states are present. Missing
+continuation state stops the batch for fresh reconciliation, never an
+unguarded fallback. This follows RFC 8620 sections 5.3 and 7.1.1; it is
+optimistic concurrency, not a cross-entity/filesystem transaction or a claim
+of global linearizability against arbitrary writers.
+
+`stateMismatch` is a typed method-level rejection, not a transport-retry
+condition. Earlier positive chunk acknowledgements are preserved and mirrored;
+current rejected and never-submitted IDs are not mirrored. A clean rejection
+or unsent operation clears its flag receipt but retains the old/NULL baseline.
+If an earlier HTTP/parse attempt could have applied, a later mismatch does
+**not** erase that ambiguous receipt. Typed method errors other than
+`serverPartialFail` guarantee no visible effects under RFC 8620 section 3.6.2;
+clean serverFail retries cannot become evidence of an older own write. A
+terminal clean method rejection preserves earlier ACKs, parks the cursor,
+and postpones dependent destructive work until fresh policy is available.
+It uses normal retryable/permanent classification rather than inventing
+ambiguity or immediately retrying a rejected per-ID operation.
+
+`SyncOutcome.replan_required` keeps the cursor parked and reports remaining
+generation work. Queued downstream mailbox destruction is postponed; only
+positively acknowledged move pairs may finish their placement/flag steps.
+For same-ID resurrection of a locally deleted mailbox, the planner excludes
+old bindings that CreateLocalMailbox will clear, so ghost paths cannot
+suppress the required downloads. Different-ID local-orphan history checks
+remain intact.
+
+`SyncEngine::run` permits three generation attempts, rebuilding a full plan
+from fresh files, observations and retained baselines. Direction filters stay
+unchanged. Successfully mirrored effects are not replayed; completed counts
+are accumulated while pending/status comes from the final attempt, and the
+final console summary uses those totals. Explicit per-ID failures keep their
+normal backoff/permission handling rather than being immediately retried by
+the generation loop. Exhaustion remains visibly incomplete and retryable by
+the daemon or another Full cycle. Tests in `sync/flag_tests/generation.rs`
+exercise these races against the stateful protocol model and real files/DB;
+real Stalwart remains a separate validation gate.
 
 ## Concurrency model
 

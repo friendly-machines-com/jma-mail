@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use maildir::TemporaryMailFile;
@@ -100,7 +100,13 @@ impl<'a> Executor<'a> {
     /// Ordinary adoptions precede their effects. Move-paired adoption and
     /// local flags instead wait for positively acknowledged membership;
     /// placement observations do not acknowledge a still-unfinished rename.
-    pub async fn execute(&self, plan: SyncPlan) -> Result<SyncOutcome> {
+    /// `planning_state` is the pre-observation Email state, independent of the
+    /// cursor. None is permitted only when no actual Email/set is requested.
+    pub async fn execute(
+        &self,
+        plan: SyncPlan,
+        planning_state: Option<&str>,
+    ) -> Result<SyncOutcome> {
         let SyncPlan {
             actions,
             new_email_state,
@@ -253,6 +259,7 @@ impl<'a> Executor<'a> {
         let uploads = resolve_upload_references(uploads, &creation_refs);
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
+        let set_state = guard_after_uploads(planning_state, &upload_results);
         let requested_moves: HashSet<_> = remote_moves
             .iter()
             .filter_map(|action| match action {
@@ -266,6 +273,7 @@ impl<'a> Executor<'a> {
                 remote_moves,
                 remote_destroys,
                 &move_pair_adopts,
+                set_state.as_deref(),
             )
             .await?;
         // set_email_batch marks every submitted ID lacking a positive ACK as
@@ -289,22 +297,32 @@ impl<'a> Executor<'a> {
         // the soon-to-be-destroyed mailbox lands first. Matches
         // the pull-side `delete_local_folders` "run after
         // per-message phases" discipline.
-        self.destroy_remote_mailboxes(remote_mailbox_destroys)
-            .await?;
+        let replan_required = outcome.replan.is_some();
+        if !replan_required {
+            self.destroy_remote_mailboxes(remote_mailbox_destroys)
+                .await?;
+        }
         let flag_updates = local_flag_updates + remote_counts.keyword_updates;
         let moved = local_moves_count + remote_counts.moves;
         let deleted = local_deletes_count + remote_counts.destroys;
-        let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
+        let failed_remote_actions = outcome
+            .failed_updates
+            .difference(&outcome.replan_updates)
+            .count()
+            + outcome
+                .failed_destroys
+                .difference(&outcome.replan_destroys)
+                .count();
         let blocked_updates: HashSet<_> = outcome
             .update_rejections
             .iter()
-            .filter(|(_, failure)| !failure.retryable)
+            .filter(|(id, failure)| !failure.retryable && !outcome.replan_updates.contains(*id))
             .map(|(id, _)| id.clone())
             .collect();
         let blocked_destroys: HashSet<_> = outcome
             .destroy_rejections
             .iter()
-            .filter(|(_, failure)| !failure.retryable)
+            .filter(|(id, failure)| !failure.retryable && !outcome.replan_destroys.contains(*id))
             .map(|(id, _)| id.clone())
             .collect();
         let retryable_remote_actions =
@@ -345,7 +363,8 @@ impl<'a> Executor<'a> {
         let deferred_move_pairs = move_pairs_attempted - move_pairs_applied;
         let pull_apply_incomplete = local_flag_updates < local_flags_attempted
             || local_moves_count < local_moves_attempted
-            || deferred_move_pairs > 0;
+            || deferred_move_pairs > 0
+            || replan_required;
         let new_email_state = resolve_email_cursor(
             new_email_state,
             pull_apply_incomplete,
@@ -374,9 +393,13 @@ impl<'a> Executor<'a> {
             retryable_local_actions: local_flags_actually_attempted - local_flag_updates
                 + local_moves_attempted
                 - local_moves_count,
-            retryable_deferred_actions,
+            replan_required,
+            retryable_deferred_actions: retryable_deferred_actions + usize::from(replan_required),
             review_actions: review_actions + remote_counts.deferred,
-            deferred_actions: remote_counts.deferred + deferred_flags + deferred_move_pairs,
+            deferred_actions: remote_counts.deferred
+                + deferred_flags
+                + deferred_move_pairs
+                + usize::from(replan_required),
             // Selected history/status and scope authority belong to the engine,
             // which knows the resolved bindings. Never query the whole DB here.
             ..Default::default()
@@ -1157,6 +1180,7 @@ impl<'a> Executor<'a> {
         moves: Vec<SyncAction>,
         destroys: Vec<SyncAction>,
         move_pair_adopts: &[SyncAction],
+        planning_state: Option<&str>,
     ) -> Result<(jmap_email::EmailSetOutcome, ApplyRemoteSetCounts)> {
         let move_snapshots: HashMap<_, _> = move_pair_adopts
             .iter()
@@ -1230,6 +1254,10 @@ impl<'a> Executor<'a> {
             ));
         }
 
+        let planning_state = planning_state
+            .filter(|state| !state.is_empty())
+            .context("Remote Email/set requires the state captured before planning")?;
+
         // Commit receipts before network I/O. A later acknowledgement DB
         // failure must not erase evidence of the generation we actually sent.
         {
@@ -1279,27 +1307,29 @@ impl<'a> Executor<'a> {
             }
             txn.commit()?;
         }
-        let outcome = match jmap_email::set_email_batch(&self.client, &ops).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let txn = self.conn.unchecked_transaction()?;
-                for action in &keywords {
-                    if let SyncAction::UpdateRemoteKeywords { id, .. } = action
-                        && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
-                    {
-                        flag_sync::failure(
-                            &txn,
-                            &id.jmap_email_id,
-                            false,
-                            false,
-                            &format!("{error:#}"),
-                        )?;
+        let outcome =
+            match jmap_email::set_email_batch_if_in_state(&self.client, &ops, planning_state).await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let txn = self.conn.unchecked_transaction()?;
+                    for action in &keywords {
+                        if let SyncAction::UpdateRemoteKeywords { id, .. } = action
+                            && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
+                        {
+                            flag_sync::failure(
+                                &txn,
+                                &id.jmap_email_id,
+                                false,
+                                false,
+                                &format!("{error:#}"),
+                            )?;
+                        }
                     }
+                    txn.commit()?;
+                    return Err(error);
                 }
-                txn.commit()?;
-                return Err(error);
-            }
-        };
+            };
 
         // Record confirmed rejection/ambiguity separately from success
         // mirroring. If an accepted ID's ACK transaction fails, a different
@@ -1413,8 +1443,8 @@ impl<'a> Executor<'a> {
             };
             if outcome.failed_updates.contains(&id.jmap_email_id) {
                 warn!(
-                    "MoveRemote {} from {} to {} rejected by server. \
-                     DB retains source folder; will be re-detected and re-attempted next cycle.",
+                    "MoveRemote {} from {} to {} was not acknowledged. \
+                     DB retains source folder; fresh reconciliation will reassess it.",
                     id, from_folder, to_folder
                 );
             } else {
@@ -1436,9 +1466,9 @@ impl<'a> Executor<'a> {
             }
             if outcome.failed_destroys.contains(&id.jmap_email_id) {
                 warn!(
-                    "DestroyRemote {} rejected by server. \
-                     Local file is already gone; server still holds the message. \
-                     Next scan will re-emit DeletedMessage and the destroy will be re-attempted.",
+                    "DestroyRemote {} was not acknowledged. \
+                     Local file is already gone; fresh reconciliation must verify \
+                     remote presence before deciding the next effect.",
                     id
                 );
                 continue;
@@ -1934,6 +1964,16 @@ async fn download_producer(
 struct ChannelStats {
     blocked_send_us: u64,
     send_count: u64,
+}
+
+fn guard_after_uploads(planning_state: Option<&str>, uploads: &UploadResults) -> Option<String> {
+    let edges = uploads.chain_pairs.iter().cloned().collect();
+    resolve_email_cursor(
+        planning_state.map(str::to_owned),
+        false,
+        uploads.chain_intact,
+        &edges,
+    )
 }
 
 /// Walk a state-advance chain forward from `cursor`. The chain is the
@@ -2573,6 +2613,36 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_guard_advances_only_through_verified_own_imports() {
+        let mut uploads = UploadResults {
+            chain_pairs: vec![("s0".into(), "s1".into()), ("s1".into(), "s2".into())],
+            chain_intact: true,
+            uploaded: 2,
+        };
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s2")
+        );
+        uploads.chain_intact = false;
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s0")
+        );
+        uploads.chain_intact = true;
+        uploads.chain_pairs.remove(0);
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s0"),
+            "an unrelated intervening write cannot authorize the old plan with a newer token"
+        );
+        assert!(
+            guard_after_uploads(None, &uploads).is_none(),
+            "own import state cannot invent a missing planning snapshot"
+        );
+    }
+
     use crate::domain::MaybeReference;
     use crate::ids::{JmapEmailId, MaildirId};
     use crate::state::db;
