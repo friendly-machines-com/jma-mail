@@ -400,6 +400,17 @@ pub fn upsert_local_state(
     Ok(())
 }
 
+/// The latest captured local observation for one bound filename identity.
+pub fn get_local_state(conn: &Connection, id: &MaildirId) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT maildir_folder, flags FROM local_state WHERE maildir_id=?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Get all local state records for a folder, keyed by maildir_id -> (folder, flags).
 pub fn get_local_state_for_folder(
     conn: &Connection,

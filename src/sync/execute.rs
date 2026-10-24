@@ -19,6 +19,7 @@ use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
 use crate::keywords::KeywordPatch;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
+use crate::state::flag_sync::{self, FlagAttempt, FlagSyncState};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
@@ -107,6 +108,9 @@ impl<'a> Executor<'a> {
             new_email_state,
         } = plan;
 
+        let mut observations = Vec::new();
+        let mut flag_states = Vec::new();
+        let mut deferred_flags = 0;
         let mut remote_mailbox_destroys = Vec::new();
         let mut local_creates = Vec::new();
         let mut local_renames = Vec::new();
@@ -126,6 +130,12 @@ impl<'a> Executor<'a> {
 
         for action in actions {
             match action {
+                SyncAction::ObserveMessage { .. } => observations.push(action),
+                SyncAction::RecordFlagState { .. } => flag_states.push(action),
+                SyncAction::DeferredFlagState { id, reason } => {
+                    warn!("Flags for {} remain pending: {}", id, reason);
+                    deferred_flags += 1;
+                }
                 SyncAction::CreateLocalMailbox { .. } => local_creates.push(action),
                 SyncAction::RenameLocalMailbox { .. } => local_renames.push(action),
                 // A move-pair adopt mirrors the DB half of a local cross-folder
@@ -172,6 +182,18 @@ impl<'a> Executor<'a> {
         // subtree lets each descendant's own action recover via
         // the source-missing/target-present branch.
         self.rename_local_mailboxes(local_renames)?;
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in flag_states {
+                if let SyncAction::RecordFlagState { id, state } = action {
+                    flag_sync::store(&txn, &id.jmap_email_id, &state)?;
+                }
+            }
+            for action in observations {
+                commit_observation(&txn, action)?;
+            }
+            txn.commit()?;
+        }
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
         let local_flags_attempted = local_flags.len();
@@ -273,6 +295,9 @@ impl<'a> Executor<'a> {
             debug!("Persisted new Email state: {}", state);
         }
 
+        let pending_flag_actions = flag_sync::pending_ids(self.conn, false)?.len();
+        let blocked_flag_actions =
+            pending_flag_actions.saturating_sub(flag_sync::pending_ids(self.conn, true)?.len());
         Ok(SyncOutcome {
             downloaded,
             uploaded,
@@ -280,7 +305,9 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
-            deferred_actions: remote_counts.deferred,
+            deferred_actions: remote_counts.deferred + deferred_flags,
+            pending_flag_actions,
+            blocked_flag_actions,
             // Engine sets these from the unfiltered plan / bindings;
             // executor doesn't have the visibility to compute them.
             already_in_sync: false,
@@ -1023,7 +1050,7 @@ impl<'a> Executor<'a> {
                         .clone(),
                     maildir_id: Some(id.maildir_id.clone()),
                     message_id: id.message_id.clone(),
-                    flags: flags.clone(),
+                    flags: keywords_to_flags(&keywords),
                     jmap_keywords: keywords_json,
                 },
             )?;
@@ -1034,6 +1061,7 @@ impl<'a> Executor<'a> {
                 flags,
                 None,
             )?;
+            flag_sync::acknowledge(&txn, jmap_email_id, flags)?;
             txn.commit()?;
             let target = RemoteId {
                 jmap_email_id: jmap_email_id.clone(),
@@ -1127,13 +1155,91 @@ impl<'a> Executor<'a> {
             ));
         }
 
-        let outcome = jmap_email::set_email_batch(&self.client, &ops).await?;
+        // Commit receipts before network I/O. A later acknowledgement DB
+        // failure must not erase evidence of the generation we actually sent.
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in &keywords {
+                if let SyncAction::UpdateRemoteKeywords {
+                    id,
+                    keywords,
+                    filename_flags,
+                } = action
+                    && let Some(record) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?
+                {
+                    let source_folder = record
+                        .maildir_id
+                        .as_ref()
+                        .map(|mid| queries::get_local_state(&txn, mid))
+                        .transpose()?
+                        .flatten()
+                        .map(|(folder, _)| folder);
+                    flag_sync::prepare_attempt(
+                        &txn,
+                        &id.jmap_email_id,
+                        FlagAttempt {
+                            source_flags: filename_flags.clone(),
+                            target_flags: keywords_to_flags(&apply_keyword_patch(
+                                &record.jmap_keywords,
+                                keywords,
+                            )),
+                            source_maildir_id: record.maildir_id,
+                            source_folder,
+                        },
+                    )?;
+                }
+            }
+            txn.commit()?;
+        }
+        let outcome = match jmap_email::set_email_batch(&self.client, &ops).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let txn = self.conn.unchecked_transaction()?;
+                for action in &keywords {
+                    if let SyncAction::UpdateRemoteKeywords { id, .. } = action
+                        && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
+                    {
+                        flag_sync::failure(
+                            &txn,
+                            &id.jmap_email_id,
+                            false,
+                            false,
+                            &format!("{error:#}"),
+                        )?;
+                    }
+                }
+                txn.commit()?;
+                return Err(error);
+            }
+        };
 
-        // One transaction wraps the entire post-network mirroring section.
-        // The server's outcome is fixed; either we reflect all of it into
-        // the local DB or none of it (next cycle re-detects the missing
-        // mirrorings via Email/changes and retries). Pure-DB after this
-        // point, so the txn is short-lived.
+        // Record confirmed rejection/ambiguity separately from success
+        // mirroring. If an accepted ID's ACK transaction fails, a different
+        // ID's confirmed rejection must not revert to an ambiguous receipt.
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in &keywords {
+                if let SyncAction::UpdateRemoteKeywords { id, .. } = action
+                    && outcome.failed_updates.contains(&id.jmap_email_id)
+                    && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
+                {
+                    let rejection = outcome.update_rejections.get(&id.jmap_email_id);
+                    flag_sync::failure(
+                        &txn,
+                        &id.jmap_email_id,
+                        rejection.is_some_and(|failure| !failure.retryable),
+                        rejection.is_some(),
+                        rejection.map_or("Email/set omitted positive acknowledgement", |failure| {
+                            failure.reason.as_str()
+                        }),
+                    )?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        // Mirror successful effects atomically, including their processed
+        // flag baselines. A rollback leaves successful IDs' receipts intact.
         let txn = self.conn.unchecked_transaction()?;
 
         // Mirror keyword updates into the local DB.
@@ -1152,8 +1258,7 @@ impl<'a> Executor<'a> {
             };
             if outcome.failed_updates.contains(&id.jmap_email_id) {
                 warn!(
-                    "UpdateRemoteKeywords for {} rejected by server. \
-                     DB retains stale keywords; will be re-detected and re-attempted next cycle.",
+                    "UpdateRemoteKeywords for {} was not acknowledged; flags remain pending",
                     id
                 );
                 continue;
@@ -1179,7 +1284,7 @@ impl<'a> Executor<'a> {
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        flags: server_flags,
+                        flags: server_flags.clone(),
                         jmap_keywords: keywords_json,
                         ..rec
                     },
@@ -1187,6 +1292,9 @@ impl<'a> Executor<'a> {
                 if let Some(mid) = maildir_id {
                     queries::update_local_state_flags(&txn, &mid, &filename_flags)?;
                 }
+                // Acknowledge only this request's captured target, not a
+                // newer suffix a MUA may have installed while it was in flight.
+                flag_sync::acknowledge(&txn, &id.jmap_email_id, &server_flags)?;
             }
             counts.keyword_updates += 1;
             info!("Updated remote keywords for {}", id);
@@ -1538,6 +1646,7 @@ impl<'a> Executor<'a> {
             },
         )?;
         queries::upsert_local_state(&txn, &mid, &binding.maildir_folder, &flags, None)?;
+        flag_sync::acknowledge(&txn, &id.jmap_email_id, &flags)?;
         txn.commit()?;
         progress.downloaded += 1;
         // Per-message progress signal for the TUI panel. Fires at
@@ -1903,6 +2012,7 @@ fn apply_update_local_flags(
         let SyncAction::UpdateLocalFlags {
             id,
             binding,
+            expected_flags,
             new_flags,
             keywords,
             jmap_blob_id,
@@ -1919,25 +2029,31 @@ fn apply_update_local_flags(
         } = id;
         let maildir_path = maildir_root.join(&binding.maildir_folder);
         let maildir = store::ensure_maildir(&maildir_path)?;
-        // A `new/` file has never carried a `:2,<flags>` view that
-        // the maildir crate's `set_flags` can find. Reaching it from
-        // the JMAP side -- typically the server flipping `$seen` --
-        // is the canonical "client first observes this message"
-        // moment, so the executor promotes it from `new/` to `cur/`
-        // and attaches the new flag set as the info suffix in the
-        // same rename. Steady-state cur/ flag updates take the
-        // existing path.
+        // Persist the generation before the filesystem effect, separately
+        // from its acknowledgement. Never overwrite a newer filename edit.
+        flag_sync::prepare_attempt(
+            conn,
+            &jmap_email_id,
+            FlagAttempt {
+                source_flags: expected_flags.clone(),
+                target_flags: keywords_to_flags(&keywords),
+                source_maildir_id: Some(maildir_id.clone()),
+                source_folder: Some(binding.maildir_folder.clone()),
+            },
+        )?;
         let was_in_new = store::message_is_in_new(&maildir, maildir_id.as_ref());
-        let store_result = if was_in_new {
-            store::promote_to_cur_with_flags(&maildir, maildir_id.as_ref(), &new_flags)
-        } else {
-            store::set_flags(&maildir, maildir_id.as_ref(), &new_flags)
-        };
+        let store_result = store::set_flags_if_unchanged(
+            &maildir,
+            maildir_id.as_ref(),
+            &expected_flags,
+            &new_flags,
+        );
         if let Err(e) = store_result {
             warn!(
                 "Failed to set flags for {} in {}: {}",
                 maildir_id, binding.maildir_folder, e
             );
+            flag_sync::failure(conn, &jmap_email_id, false, false, &e.to_string())?;
             continue;
         }
         // Predict the post-rename cur/ filename and feed it to the
@@ -1965,7 +2081,7 @@ fn apply_update_local_flags(
         queries::upsert_message(
             &txn,
             &MessageRecord {
-                jmap_email_id,
+                jmap_email_id: jmap_email_id.clone(),
                 jmap_blob_id: Some(jmap_blob_id),
                 jmap_thread_id: Some(jmap_thread_id),
                 jmap_mailbox_id: binding
@@ -1976,11 +2092,12 @@ fn apply_update_local_flags(
                     .clone(),
                 maildir_id: Some(maildir_id.clone()),
                 message_id,
-                flags: new_flags.clone(),
+                flags: keywords_to_flags(&keywords),
                 jmap_keywords: keywords_json,
             },
         )?;
         queries::upsert_local_state(&txn, &maildir_id, &binding.maildir_folder, &new_flags, None)?;
+        flag_sync::acknowledge(&txn, &jmap_email_id, &keywords_to_flags(&keywords))?;
         txn.commit()?;
         succeeded += 1;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
@@ -2031,7 +2148,39 @@ fn apply_keyword_patch(existing_json: &str, patch: &KeywordPatch) -> HashMap<Str
 /// DB writes for a single AdoptLocalMessage. Shared between the
 /// up-front adopt phase and the post-remote-set move-pair phase so
 /// both go through the same row-shape and ordering.
+fn commit_observation(conn: &Connection, action: SyncAction) -> Result<()> {
+    let SyncAction::ObserveMessage {
+        id,
+        binding,
+        keywords,
+        filename_flags,
+        jmap_blob_id,
+        jmap_thread_id,
+    } = action
+    else {
+        return Ok(());
+    };
+    commit_binding(
+        conn,
+        SyncAction::AdoptLocalMessage {
+            id,
+            binding,
+            keywords,
+            filename_flags,
+            jmap_blob_id,
+            jmap_thread_id,
+            old_maildir_id: None,
+            old_jmap_email_id: None,
+        },
+        false,
+    )
+}
+
 fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
+    commit_binding(conn, action, true)
+}
+
+fn commit_binding(conn: &Connection, action: SyncAction, initialize_agreement: bool) -> Result<()> {
     let SyncAction::AdoptLocalMessage {
         id,
         binding,
@@ -2089,7 +2238,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
                 .clone(),
             maildir_id: Some(maildir_id.clone()),
             message_id,
-            flags: server_flags,
+            flags: server_flags.clone(),
             jmap_keywords: keywords_json,
         },
     )?;
@@ -2100,6 +2249,13 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         &filename_flags,
         None,
     )?;
+    if initialize_agreement {
+        if flag_sync::mapped_flags(&filename_flags) == server_flags {
+            flag_sync::acknowledge(conn, &jmap_email_id, &filename_flags)?;
+        } else if flag_sync::get(conn, &jmap_email_id)?.is_none() {
+            flag_sync::store(conn, &jmap_email_id, &FlagSyncState::default())?;
+        }
+    }
     debug!(
         "Adopted {}/{} as {}",
         binding.maildir_folder,
@@ -2804,6 +2960,7 @@ mod tests {
                 maildir_folder: "INBOX".to_string(),
                 remote_path: "INBOX".to_string(),
             }),
+            expected_flags: "".into(),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),
@@ -2898,6 +3055,7 @@ mod tests {
                 maildir_folder: "INBOX".to_string(),
                 remote_path: "INBOX".to_string(),
             }),
+            expected_flags: "".into(),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),

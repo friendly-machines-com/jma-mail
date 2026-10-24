@@ -20,7 +20,7 @@ use crate::maildir_ops::layout::{
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
-use crate::state::queries;
+use crate::state::{flag_sync, queries};
 use crate::sync::bindings::{MailboxBindings, MailboxBindingsBuilder};
 use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
@@ -80,6 +80,10 @@ pub struct SyncOutcome {
     /// Local changes deferred because the current inventory cannot establish
     /// a safe identity transition. These are not successful synchronization.
     pub deferred_actions: usize,
+    /// Unsettled flag generations remain visible even without a new delta.
+    pub pending_flag_actions: usize,
+    /// Pending flag histories that require explicit review or permission repair.
+    pub blocked_flag_actions: usize,
     /// True when reconcile produced an empty plan -- neither side had
     /// work to do. The daemon uses this to flag spurious `LocalChange`
     /// triggers (FS notification fired but nothing actually changed)
@@ -211,6 +215,12 @@ impl<'a> SyncEngine<'a> {
         direction: SyncDirection,
         mut scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
+        if matches!(scan_scope, ScanScope::Paths(_))
+            && (flag_sync::has_unverified(self.conn)?
+                || !flag_sync::pending_ids(self.conn, true)?.is_empty())
+        {
+            scan_scope = ScanScope::Full;
+        }
         let mut mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.canonical_maildir_root()?;
 
@@ -559,11 +569,46 @@ impl<'a> SyncEngine<'a> {
             .resurrect_remote_orphans_for_server_wins(mailboxes, remote_emails)
             .await?;
 
-        // Phase 3: build known indices and reconcile.
+        // Verification reads are observations, not Email/changes events.
+        // In particular they must not create a spurious delete/update conflict.
+        let mut known = build_known_indices(self.conn, &mailboxes)?;
+        let observed: HashSet<_> = remote_emails.iter().map(|email| email.id.clone()).collect();
+        let destroyed: HashSet<_> = remote_destroyed.iter().cloned().collect();
+        let verify: Vec<_> = known
+            .by_jmap
+            .values()
+            .filter(|record| {
+                record.maildir_id.is_some()
+                    && !observed.contains(&record.jmap_email_id)
+                    && !destroyed.contains(&record.jmap_email_id)
+                    && known
+                        .flag_sync
+                        .get(&record.jmap_email_id)
+                        .is_some_and(|state| {
+                            state.legacy
+                                || state.review
+                                || state.baseline.is_none()
+                                || state.attempt.is_some()
+                        })
+            })
+            .map(|record| record.jmap_email_id.clone())
+            .collect();
+        if !verify.is_empty() {
+            let fresh = self.batched_get(&verify).await?;
+            known
+                .remote_observations
+                .extend(fresh.into_iter().map(|email| (email.id.clone(), email)));
+            known.unverified_remote.extend(
+                verify
+                    .into_iter()
+                    .filter(|id| !known.remote_observations.contains_key(id)),
+            );
+        }
+
+        // Phase 3: build a pure plan from observations and acknowledged state.
         let plan = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "reconcile").entered();
-            let known = build_known_indices(self.conn, &mailboxes)?;
             reconcile::reconcile(ReconcileInput {
                 remote_emails: &remote_emails,
                 remote_destroyed: &remote_destroyed,
@@ -701,7 +746,8 @@ impl<'a> SyncEngine<'a> {
                 "execute",
             ))
             .await?;
-        outcome.already_in_sync = already_in_sync;
+        outcome.already_in_sync =
+            already_in_sync && outcome.pending_flag_actions == 0 && outcome.deferred_actions == 0;
         outcome.deferred_actions += deferred_actions;
         outcome.remote_orphans_detected = mailboxes.remote_orphans().len();
         outcome.remote_orphan_total_emails = mailboxes
@@ -1523,13 +1569,45 @@ fn build_known_indices(
     mailboxes: &MailboxBindings,
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
+    let flag_states = flag_sync::load(conn)?;
 
-    for binding in mailboxes.iter() {
+    // Pending flag histories in local orphans must remain visible to the
+    // destructive-folder conflict pass too, even without a new local delta.
+    for binding in mailboxes.scan_set(true) {
         let mailbox_id = binding
             .jmap_mailbox_id
-            .expect_resolved("build_known_indices -- live bindings must be resolved");
+            .expect_resolved("build_known_indices -- scan bindings must be resolved");
         let messages = queries::get_messages_by_jmap_mailbox_id(conn, mailbox_id)?;
+        let local = queries::get_local_state_for_folder(conn, &binding.maildir_folder)?;
         for msg in messages {
+            let state = flag_states
+                .get(&msg.jmap_email_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let local_flags = msg
+                        .maildir_id
+                        .as_ref()
+                        .and_then(|id| local.get(id))
+                        .map(|(_, flags)| flag_sync::mapped_flags(flags));
+                    let cached: Option<HashMap<String, bool>> =
+                        serde_json::from_str(&msg.jmap_keywords).ok();
+                    let cached_flags = cached
+                        .as_ref()
+                        .map(crate::maildir_ops::flags::keywords_to_flags);
+                    let common = local_flags
+                        .as_ref()
+                        .filter(|flags| {
+                            *flags == &msg.flags && cached_flags.as_ref() == Some(*flags)
+                        })
+                        .cloned();
+                    flag_sync::FlagSyncState {
+                        review: common.is_none(),
+                        baseline: common,
+                        legacy: true,
+                        ..Default::default()
+                    }
+                });
+            idx.flag_sync.insert(msg.jmap_email_id.clone(), state);
             // Wrap once; the three projections share via Arc
             // refcount instead of cloning the full record into two
             // of them. Per-cycle peak shrinks roughly 2.5x at the
@@ -2511,8 +2589,11 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
                 "{:?}: dropped DestroyRemoteMailbox {} (id {})",
                 direction, binding.remote_path, binding.jmap_mailbox_id
             ),
-            // Adoption is always kept; it never appears here.
-            SyncAction::AdoptLocalMessage { .. } => {}
+            // Direction-neutral metadata is always kept; it never appears here.
+            SyncAction::AdoptLocalMessage { .. }
+            | SyncAction::ObserveMessage { .. }
+            | SyncAction::RecordFlagState { .. }
+            | SyncAction::DeferredFlagState { .. } => {}
         }
     }
 }

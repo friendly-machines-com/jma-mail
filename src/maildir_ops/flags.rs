@@ -49,6 +49,23 @@ pub fn flags_to_keywords(flags: &str) -> HashMap<String, bool> {
     keywords
 }
 
+/// Replace only owned filename flags, retaining local suffix extensions.
+pub fn merge_mapped_flags(current: &str, desired: &str) -> String {
+    let owned = |flag: char| {
+        FLAG_MAPPINGS
+            .iter()
+            .any(|(_, mapped)| mapped.starts_with(flag))
+    };
+    let mut result: Vec<char> = current
+        .chars()
+        .filter(|flag| !owned(*flag))
+        .chain(desired.chars().filter(|flag| owned(*flag)))
+        .collect();
+    result.sort_unstable();
+    result.dedup();
+    result.into_iter().collect()
+}
+
 /// Set or remove each of the six mapped keywords, leaving every
 /// unowned keyword unmentioned. The wire encoder emits Set as true and
 /// Remove as null; this is not a replacement keyword property map.

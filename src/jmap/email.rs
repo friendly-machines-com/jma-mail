@@ -396,23 +396,29 @@ pub enum EmailSetOp {
     Destroy { email_id: JmapEmailId },
 }
 
-/// Outcome of `set_email_batch`. The two `failed_*` sets contain ids
-/// the server rejected per-row (notUpdated / notDestroyed); callers
-/// should suppress DB mirror for those ids.
+/// A confirmed per-object rejection, unlike an absent acknowledgement.
+#[derive(Debug)]
+pub struct EmailSetRejection {
+    pub retryable: bool,
+    pub reason: String,
+}
+
+/// Outcome of `set_email_batch`. The two `failed_*` sets include both
+/// confirmed per-ID rejections and missing positive acknowledgements;
+/// callers must suppress DB mirroring for these IDs. The rejection maps
+/// preserve typed retry classification and distinguish confirmed failure
+/// from ambiguity, so only the latter retains an in-flight receipt.
 ///
-/// `chain_old` / `chain_new` carry the JMAP `oldState` / `newState`
-/// fields from the `Email/set` response(s). Across multiple chunks
-/// (when the grouped objects exceed `maxObjectsInSet`), the chain is
-/// considered intact iff each subsequent chunk's `oldState` matches
-/// the previous chunk's `newState` -- i.e. nothing third-party landed
-/// between chunks. When intact, `chain_old` is the very first chunk's
-/// `oldState` and `chain_new` is the very last chunk's `newState`.
-/// When the chain breaks, `chain_new` is set to `None` so the section 7.1
-/// cursor ratchet at the call site won't fire.
+/// `chain_old` / `chain_new` carry the first oldState and last newState
+/// across chunks, provided each oldState matches the previous newState.
+/// A broken or incomplete chain sets chain_new to None, disabling the
+/// section 7.1 cursor ratchet at the call site.
 #[derive(Debug, Default)]
 pub struct EmailSetOutcome {
     pub failed_updates: std::collections::HashSet<JmapEmailId>,
     pub failed_destroys: std::collections::HashSet<JmapEmailId>,
+    pub update_rejections: HashMap<JmapEmailId, EmailSetRejection>,
+    pub destroy_rejections: HashMap<JmapEmailId, EmailSetRejection>,
     pub chain_old: Option<String>,
     pub chain_new: Option<String>,
 }
@@ -424,6 +430,8 @@ impl EmailSetOutcome {
     pub(crate) fn merge(&mut self, other: EmailSetOutcome) {
         self.failed_updates.extend(other.failed_updates);
         self.failed_destroys.extend(other.failed_destroys);
+        self.update_rejections.extend(other.update_rejections);
+        self.destroy_rejections.extend(other.destroy_rejections);
 
         // Chain extension: each subsequent chunk's `chain_old` must
         // match the previous chunk's `chain_new` for the chain to
@@ -567,7 +575,7 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
             if !destroy_ids.is_empty() {
                 args.insert("destroy".into(), serde_json::to_value(destroy_ids)?);
             }
-            let response =
+            let mut response =
                 super::email_set::send(client, &http, serde_json::Value::Object(args)).await?;
 
             let chain_old = response.old_state().map(String::from);
@@ -587,16 +595,44 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
                 chain_new,
                 ..Default::default()
             };
-            if let Some(not_updated) = response.not_updated_ids() {
-                for id in not_updated {
-                    tracing::warn!("Email/set batch: notUpdated {}", id);
-                    outcome.failed_updates.insert(id.as_str().into());
+            let rejected_updates: Vec<_> = response
+                .not_updated_ids()
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            let rejected_destroys: Vec<_> = response
+                .not_destroyed_ids()
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            for id in rejected_updates {
+                tracing::warn!("Email/set batch: notUpdated {}", id);
+                outcome.failed_updates.insert(id.as_str().into());
+                if let Err(error) = response.updated(&id) {
+                    let error = anyhow::Error::from(error);
+                    outcome.update_rejections.insert(
+                        id.into(),
+                        EmailSetRejection {
+                            retryable: super::retry::is_transient_error(&error),
+                            reason: error.to_string(),
+                        },
+                    );
                 }
             }
-            if let Some(not_destroyed) = response.not_destroyed_ids() {
-                for id in not_destroyed {
-                    tracing::warn!("Email/set batch: notDestroyed {}", id);
-                    outcome.failed_destroys.insert(id.as_str().into());
+            for id in rejected_destroys {
+                tracing::warn!("Email/set batch: notDestroyed {}", id);
+                outcome.failed_destroys.insert(id.as_str().into());
+                if let Err(error) = response.destroyed(&id) {
+                    let error = anyhow::Error::from(error);
+                    outcome.destroy_rejections.insert(
+                        id.into(),
+                        EmailSetRejection {
+                            retryable: super::retry::is_transient_error(&error),
+                            reason: error.to_string(),
+                        },
+                    );
                 }
             }
 

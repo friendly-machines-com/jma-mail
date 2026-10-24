@@ -88,6 +88,25 @@ impl BoundId {
 /// discriminator.
 #[derive(Debug)]
 pub enum SyncAction {
+    /// Persist observations without acknowledging a flag mutation.
+    ObserveMessage {
+        id: BoundId,
+        binding: Arc<MailboxFolderBinding>,
+        keywords: HashMap<String, bool>,
+        filename_flags: String,
+        jmap_blob_id: Option<JmapBlobId>,
+        jmap_thread_id: Option<JmapThreadId>,
+    },
+    /// Initialize or recover the acknowledged generation separately from observations.
+    RecordFlagState {
+        id: RemoteId,
+        state: crate::state::flag_sync::FlagSyncState,
+    },
+    /// Unresolved history/presence is visible work, not an empty successful plan.
+    DeferredFlagState {
+        id: RemoteId,
+        reason: String,
+    },
     // Server -> Local
     DownloadMessage {
         id: RemoteId,
@@ -99,6 +118,8 @@ pub enum SyncAction {
     UpdateLocalFlags {
         id: BoundId,
         binding: Arc<MailboxFolderBinding>,
+        /// Raw filename suffix observed by the planner, not a later MUA edit.
+        expected_flags: String,
         new_flags: String,
         keywords: HashMap<String, bool>,
         jmap_blob_id: JmapBlobId,
@@ -425,7 +446,10 @@ impl SyncAction {
             | SyncAction::CreateRemoteMailbox { .. }
             | SyncAction::RenameRemoteMailbox { .. }
             | SyncAction::DestroyRemoteMailbox { .. } => ActionDirection::Push,
-            SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
+            SyncAction::AdoptLocalMessage { .. }
+            | SyncAction::ObserveMessage { .. }
+            | SyncAction::RecordFlagState { .. }
+            | SyncAction::DeferredFlagState { .. } => ActionDirection::Both,
         }
     }
 }
@@ -640,6 +664,15 @@ impl fmt::Display for SyncPlan {
 
         for action in &self.actions {
             match action {
+                SyncAction::ObserveMessage { id, .. } => {
+                    writeln!(f, "  [STATE] Observe {}", id.as_remote())?
+                }
+                SyncAction::RecordFlagState { id, .. } => {
+                    writeln!(f, "  [STATE] Record flag baseline for {}", id)?
+                }
+                SyncAction::DeferredFlagState { id, reason } => {
+                    writeln!(f, "  [PENDING] {}: {}", id, reason)?
+                }
                 SyncAction::DownloadMessage { id, binding, .. } => writeln!(
                     f,
                     "  [PULL]  Download {} -> {}/",
