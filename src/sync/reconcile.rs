@@ -1427,20 +1427,17 @@ fn process_remote_emails(
             .and_then(|ids| ids.first())
             .cloned();
 
-        // Unknown JMAP id and no Message-ID: refuse to ingest.
-        // jma's idempotency invariant requires Message-ID as the
-        // adopt anchor across state-DB wipes; downloading without one
-        // means the next state-DB wipe would re-download the same
-        // bytes as a fresh local file (dup on disk) instead of
-        // adopting the existing one. Skip the email; it stays on the
-        // server, and the cycle still advances state. error! because
-        // the user (or the server admin) must fix the source: sync
-        // cannot synthesize a Message-ID retroactively.
+        // Unknown JMAP id without a Message-ID: the current ingest model
+        // has no headerless correlation path after a DB rebuild. Leave it
+        // on the server; the cycle can still advance its cursor. This is
+        // a jma limitation, not invalid mail: RFC 5322 section 3.6.4 says
+        // the header SHOULD be present, not MUST. Do not synthesize one
+        // or mistake arbitrary client-supplied values for content identity.
         let Some(local_msg_id) = local_msg_id else {
             error!(
                 "Skipping remote email {} (folder {}): no Message-ID in Email/get response. \
-                 jma requires Message-ID to anchor idempotency across state-DB wipes; \
-                 the server returned an RFC-violating email and we won't ingest it.",
+                 jma currently requires Message-ID for new-message identity; \
+                 leaving the server email untouched (headerless ingest is unsupported).",
                 email.id, binding.maildir_folder
             );
             continue;

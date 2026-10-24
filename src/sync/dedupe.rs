@@ -394,9 +394,8 @@ fn push_candidate(
         Some(id) => id,
         None => {
             error!(
-                "Skipping {} ({}): no Message-ID header. \
-                 jma requires Message-ID to anchor idempotency; \
-                 fix the file or remove it.",
+                "Skipping dedupe/indexing for {} ({}): no usable Message-ID header; \
+                 leaving the file unchanged. Headerless ingest is not currently supported.",
                 maildir_id,
                 path.display()
             );
@@ -443,6 +442,29 @@ mod tests {
                 });
         }
         index
+    }
+
+    #[test]
+    fn dedupe_without_message_id_preserves_even_identical_files() {
+        let tmp = TempDir::new().unwrap();
+        let inbox = tmp.path().join("INBOX");
+        ensure_maildir(&inbox).unwrap();
+        let body = "From: sender@example.org\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nSubject: no msgid\r\n\r\nbody\r\n";
+        let paths = [
+            inbox.join("cur/1700000000.M1.host:2,F"),
+            inbox.join("cur/1700000001.M2.host:2,S"),
+            inbox.join("new/1700000002.M3.host"),
+        ];
+        for path in &paths {
+            fs::write(path, body).unwrap();
+        }
+        let plan = plan_dedupe(tmp.path(), &["INBOX".into()]).unwrap();
+        assert!(plan.kept.is_empty(), "no header-based adoption candidates");
+        assert!(plan.deletions.is_empty());
+        apply_dedupe(tmp.path(), &plan).unwrap();
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), body.as_bytes());
+        }
     }
 
     /// Finder writes .DS_Store metadata into folders it browses,

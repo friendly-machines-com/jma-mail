@@ -73,6 +73,16 @@ reconciliation under the configured policy, not a continuation of the lost
 history. Message-ID alone is not a content digest or proof of an unambiguous
 match. A normal restart with the same DB preserves more recovery information.
 
+Message-ID is client-supplied: unrelated messages and different draft versions
+can reuse it. Content-distinct local copies are preserved, not deleted merely
+because their headers match.
+
+**Current limitation:** new local messages and previously unbound remote emails
+require a Message-ID for ingest. Without one they are skipped and left at the
+source, not synced. Existing JMAP-ID bindings can still receive flag/move
+updates without that header. Its absence is not itself an RFC violation:
+[RFC 5322 recommends it, but does not require it](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.4).
+
 So what's stored in the state DB?
 
   * A bidirectional `message_map`, mapping between a JMAP email and its local maildir file. `jma` stores the name of the local Maildir file and its corresponding `message_id` as a fast lookup cache

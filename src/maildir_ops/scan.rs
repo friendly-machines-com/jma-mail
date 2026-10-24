@@ -128,12 +128,11 @@ pub(crate) fn inventory_identities<'a>(
 pub enum LocalChange {
     /// A new message file appeared that we don't have in the DB.
     ///
-    /// `message_id` is required: scan refuses to emit `NewMessage` for a
-    /// file whose `Message-ID` header is missing or unparseable. Without
-    /// it, the disposable-state-DB invariant breaks (a wipe + re-sync
-    /// would re-upload the file as a fresh server email rather than
-    /// adopting the existing one), so the file is dropped at the scan
-    /// boundary with an `error!` and stays on disk untouched.
+    /// `message_id` is required by jma's current ingest model: scan
+    /// refuses to emit `NewMessage` without a usable header, logging an
+    /// `error!` and leaving the file untouched. Headerless identity after
+    /// a DB rebuild is not implemented. The client-supplied header is a
+    /// correlation hint, not proof of uniqueness or byte identity.
     NewMessage {
         maildir_id: MaildirId,
         /// The mailbox this file lives in, as a single typed unit.
@@ -857,9 +856,9 @@ fn stat_size(path: &Path) -> u64 {
 }
 
 /// Parse the file's `Message-ID` header, returning `Ok(Some(_))` when
-/// a usable id is present and `Ok(None)` (with an `error!` log) when
-/// the header is missing — the user produced an RFC-violating file
-/// that sync can't anchor idempotently, so the caller skips it.
+/// a usable id is present and `Ok(None)` (with an `error!` log) otherwise.
+/// RFC 5322 section 3.6.4 recommends, but does not require, this header;
+/// skipping headerless ingest is jma's current limitation, not invalid mail.
 ///
 /// I/O errors (file vanished mid-scan, EACCES, malformed UTF-8 in a
 /// header) propagate as `Err` and abort the scan: those are systemic
@@ -871,9 +870,9 @@ fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<Mess
         Some(mid) => Ok(Some(mid)),
         None => {
             error!(
-                "Skipping {} ({}): no Message-ID header. \
-                 jma requires Message-ID to anchor idempotency; \
-                 fix the file or remove it.",
+                "Skipping {} ({}): no usable Message-ID header. \
+                 jma currently requires Message-ID for new-message identity; \
+                 leaving the file unchanged (headerless ingest is unsupported).",
                 maildir_id,
                 path.display()
             );
@@ -1287,15 +1286,38 @@ mod tests {
         );
     }
 
-    /// A file with no Message-ID header (RFC 5322 says it SHOULD be
-    /// present, but isn't a hard MUST) must NOT be ingested: jma
-    /// anchors idempotency on Message-ID, and emitting NewMessage
-    /// without one would either drop the message at reconcile or
-    /// produce a server-side duplicate after a state DB wipe. Scan
-    /// drops the file (logs error!) so it stays on disk untouched
-    /// -- crucially, it does NOT emit DeletedMessage either,
-    /// because the file is still observed on disk; only files
-    /// missing from disk trigger deletion-detection.
+    #[test]
+    fn fresh_message_without_message_id_is_preserved_by_full_and_path_scans() {
+        for side in ["cur", "new"] {
+            let tmp = TempDir::new().unwrap();
+            let inbox_path = tmp.path().join("INBOX");
+            let inbox = ensure_maildir(&inbox_path).unwrap();
+            let id = MaildirId::from("1700000000.M1.host");
+            let filename = format!("{id}:2,F");
+            let body = "From: sender@example.org\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nSubject: no msgid\r\n\r\nbody\r\n";
+            write_message(&inbox_path, side, &filename, body);
+            let path = inbox_path.join(side).join(filename);
+
+            let full = scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &HashMap::new()).unwrap();
+            let paths = scan_paths(
+                tmp.path(),
+                std::slice::from_ref(&path),
+                &HashMap::from([("INBOX".to_string(), HashMap::new())]),
+                &bindings_with("INBOX", "MB-INBOX"),
+                FolderLayout::Fs,
+            )
+            .unwrap();
+            for result in [full, paths] {
+                assert!(result.changes.is_empty(), "{side}: {:?}", result.changes);
+                assert_eq!(result.local_flags.get(&id).map(String::as_str), Some("F"));
+            }
+            assert_eq!(fs::read(&path).unwrap(), body.as_bytes());
+        }
+    }
+
+    /// A missing Message-ID does not make a live file a deletion. The
+    /// current ingest policy leaves it untouched; presence still matters
+    /// even when no NewMessage can be emitted.
     #[test]
     fn scan_folder_msgid_missing_does_not_trigger_deleted_message() {
         let tmp = TempDir::new().unwrap();

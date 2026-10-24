@@ -118,7 +118,7 @@ The system juggles several opaque IDs from different namespaces. Knowing which i
 
 **Cross-cutting.**
 
-- `Message-ID` -- the RFC 5322 header. The **only** identifier shared by both sides. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<MessageId>`, since RFC 5322 technically allows multiple values). NOT unique in `message_map`: the same Message-ID can legitimately appear in multiple rows (same email delivered to two folders, or sent messages stored in both Sent and the conversation thread folder). This is the identifier that survives a state DB wipe and lets us rebind known files without re-downloading.
+- `Message-ID` -- the client-supplied RFC 5322 header used for best-effort cross-side correlation. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<MessageId>`). It may be absent, constant across unrelated messages, or reused across content-distinct draft versions. NOT unique in `message_map`: multiple files/server objects can carry the same header. It can help rebind existing files after a DB wipe, but is not proof of byte identity, a unique match, or destructive authority.
 
 ### ID newtypes
 
@@ -181,7 +181,7 @@ Read this before touching anything in `src/sync/` or `src/maildir_ops/`.
 Two distinct identifiers anchor the system:
 
 - **JMAP `email_id`** -- stable per server, lives in `message_map`.
-- **RFC 5322 `Message-ID`** -- stable across both sides, survives a state DB wipe.
+- **RFC 5322 `Message-ID`** -- an unreliable client-supplied correlation hint that may survive a state DB wipe; not a unique identity or content digest.
 
 The state DB is **rebuildable, not a lossless journal**. Recreating it starts a new reconciliation from the current maildir and server state. Message-ID-based adoption is intended to reuse existing files rather than download another copy; it cannot reconstruct the history of changes made before the reset. The current recovery mechanisms are:
 
@@ -205,7 +205,7 @@ The state DB is **rebuildable, not a lossless journal**. Recreating it starts a 
    one-import-per-Message-ID rule. Message-ID-based adoption reuses supported,
    unambiguous matches; it is not proof of byte identity or lost-history recovery.
 
-3. **Both ingest boundaries refuse Message-ID-less messages.** Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `sync::dedupe::plan_dedupe`. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. The result: no row enters `message_map`, and no `LocalChange::NewMessage` is emitted, without an anchor.
+3. **Both ingest boundaries still refuse Message-ID-less messages.** This is jma's current identity-policy limitation, not a transport requirement: [RFC 5322 section 3.6.4](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.4) recommends the header with SHOULD, not MUST. Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `sync::dedupe::plan_dedupe`, leaving the bytes untouched. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`; they stay on the server, but the cycle may advance its cursor, so this is not queued headerless ingestion. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. No synthetic header or headerless identity is introduced.
 
 Don't add a code path that writes to a maildir outside `Executor::execute` (or `apply_dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
 
