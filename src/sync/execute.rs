@@ -94,14 +94,12 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// Walk a SyncPlan in dependency order:
-    /// adopt -> download -> local-flags -> local-move -> local-delete ->
-    /// delete-local-folder -> upload -> remote-keywords -> remote-move ->
-    /// remote-destroy.
+    /// Observe/history -> ordinary adopt/pull -> upload -> remote set ->
+    /// acknowledged move-pair placement -> destination flag effects.
     ///
-    /// Adoptions run first so subsequent actions on the same maildir_id /
-    /// jmap_email_id see the binding. Server-side mutations come last so
-    /// pull-side state is settled before we report it back.
+    /// Ordinary adoptions precede their effects. Move-paired adoption and
+    /// local flags instead wait for positively acknowledged membership;
+    /// placement observations do not acknowledge a still-unfinished rename.
     pub async fn execute(&self, plan: SyncPlan) -> Result<SyncOutcome> {
         let SyncPlan {
             actions,
@@ -197,7 +195,17 @@ impl<'a> Executor<'a> {
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
         let local_flags_attempted = local_flags.len();
-        let local_flag_updates = self.update_local_flags(local_flags)?;
+        let paired_ids: HashSet<_> = move_pair_adopts
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::AdoptLocalMessage { id, .. } => Some(id.jmap_email_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let (move_pair_flags, local_flags): (Vec<_>, Vec<_>) = local_flags.into_iter().partition(|action| {
+            matches!(action, SyncAction::UpdateLocalFlags { id, .. } if paired_ids.contains(&id.jmap_email_id))
+        });
+        let mut local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_attempted = local_moves.len();
         let local_moves_count = self.move_local_messages(local_moves)?;
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
@@ -233,9 +241,35 @@ impl<'a> Executor<'a> {
         let uploads = resolve_upload_references(uploads, &creation_refs);
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
+        let requested_moves: HashSet<_> = remote_moves
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::MoveRemote { id, .. } => Some(id.jmap_email_id.clone()),
+                _ => None,
+            })
+            .collect();
         let (outcome, remote_counts) = self
-            .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
+            .apply_remote_set(
+                remote_keywords,
+                remote_moves,
+                remote_destroys,
+                &move_pair_adopts,
+            )
             .await?;
+        // set_email_batch marks every submitted ID lacking a positive ACK as
+        // failed. Absence from failures proves nothing for a filtered-out move.
+        let acknowledged_moves: HashSet<_> = requested_moves
+            .difference(&outcome.failed_updates)
+            .cloned()
+            .collect();
+        let move_pairs_attempted = move_pair_adopts.len();
+        let move_pairs_applied =
+            apply_move_pair_adopts(self.conn, move_pair_adopts, &acknowledged_moves)?;
+        // Placement/observations land first. A failed destination rename then
+        // leaves the old flag baseline and a destination receipt for recovery.
+        local_flag_updates += self.update_local_flags(move_pair_flags.into_iter().filter(|action| {
+            matches!(action, SyncAction::UpdateLocalFlags { id, .. } if acknowledged_moves.contains(&id.jmap_email_id))
+        }).collect())?;
         // DestroyRemoteMailbox runs after every per-email push
         // phase so any cycle-local Upload/Move/Update targeting
         // the soon-to-be-destroyed mailbox lands first. Matches
@@ -246,7 +280,6 @@ impl<'a> Executor<'a> {
         let flag_updates = local_flag_updates + remote_counts.keyword_updates;
         let moved = local_moves_count + remote_counts.moves;
         let deleted = local_deletes_count + remote_counts.destroys;
-        apply_move_pair_adopts(self.conn, move_pair_adopts, &outcome.failed_updates)?;
         let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
 
         // RFC 8620 section 7.1 cursor ratchet, combined across every
@@ -277,8 +310,10 @@ impl<'a> Executor<'a> {
         // left its paired DB write unwritten. Advancing the cursor
         // past the delta that produced it would strand the change
         // silently -- see `resolve_email_cursor`.
-        let pull_apply_incomplete =
-            local_flag_updates < local_flags_attempted || local_moves_count < local_moves_attempted;
+        let deferred_move_pairs = move_pairs_attempted - move_pairs_applied;
+        let pull_apply_incomplete = local_flag_updates < local_flags_attempted
+            || local_moves_count < local_moves_attempted
+            || deferred_move_pairs > 0;
         let new_email_state = resolve_email_cursor(
             new_email_state,
             pull_apply_incomplete,
@@ -305,7 +340,7 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
-            deferred_actions: remote_counts.deferred + deferred_flags,
+            deferred_actions: remote_counts.deferred + deferred_flags + deferred_move_pairs,
             pending_flag_actions,
             blocked_flag_actions,
             // Engine sets these from the unfiltered plan / bindings;
@@ -1089,7 +1124,15 @@ impl<'a> Executor<'a> {
         keywords: Vec<SyncAction>,
         moves: Vec<SyncAction>,
         destroys: Vec<SyncAction>,
+        move_pair_adopts: &[SyncAction],
     ) -> Result<(jmap_email::EmailSetOutcome, ApplyRemoteSetCounts)> {
+        let move_snapshots: HashMap<_, _> = move_pair_adopts
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::AdoptLocalMessage { id, .. } => Some((&id.jmap_email_id, action)),
+                _ => None,
+            })
+            .collect();
         let mut ops: Vec<EmailSetOp> = Vec::new();
         for action in &keywords {
             if let SyncAction::UpdateRemoteKeywords { id, keywords, .. } = action {
@@ -1167,16 +1210,28 @@ impl<'a> Executor<'a> {
                 } = action
                     && let Some(record) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?
                 {
-                    let source_folder = record
-                        .maildir_id
-                        .as_ref()
-                        .map(|mid| queries::get_local_state(&txn, mid))
-                        .transpose()?
-                        .flatten()
-                        .map(|(folder, _)| folder);
-                    flag_sync::prepare_attempt(
-                        &txn,
-                        &id.jmap_email_id,
+                    let attempt = if let Some(SyncAction::AdoptLocalMessage {
+                        id,
+                        binding,
+                        keywords,
+                        filename_flags,
+                        ..
+                    }) = move_snapshots.get(&id.jmap_email_id).copied()
+                    {
+                        FlagAttempt {
+                            source_flags: filename_flags.clone(),
+                            target_flags: keywords_to_flags(keywords),
+                            source_maildir_id: Some(id.maildir_id.clone()),
+                            source_folder: Some(binding.maildir_folder.clone()),
+                        }
+                    } else {
+                        let source_folder = record
+                            .maildir_id
+                            .as_ref()
+                            .map(|mid| queries::get_local_state(&txn, mid))
+                            .transpose()?
+                            .flatten()
+                            .map(|(folder, _)| folder);
                         FlagAttempt {
                             source_flags: filename_flags.clone(),
                             target_flags: keywords_to_flags(&apply_keyword_patch(
@@ -1185,8 +1240,9 @@ impl<'a> Executor<'a> {
                             )),
                             source_maildir_id: record.maildir_id,
                             source_folder,
-                        },
-                    )?;
+                        }
+                    };
+                    flag_sync::prepare_attempt(&txn, &id.jmap_email_id, attempt)?;
                 }
             }
             txn.commit()?;
@@ -1261,6 +1317,14 @@ impl<'a> Executor<'a> {
                     "UpdateRemoteKeywords for {} was not acknowledged; flags remain pending",
                     id
                 );
+                continue;
+            }
+            if move_snapshots.contains_key(&id.jmap_email_id) {
+                // The post-membership stage commits the full selected remote
+                // view with the destination snapshot. Do not mirror into the
+                // missing source or retire its destination receipt beforehand.
+                counts.keyword_updates += 1;
+                info!("Updated remote keywords for moved {}", id);
                 continue;
             }
             if let Some(rec) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)? {
@@ -1968,36 +2032,36 @@ fn adopt_messages(conn: &Connection, actions: Vec<SyncAction>) -> Result<()> {
     Ok(())
 }
 
-/// Apply the move-pair adopts deferred from `Executor::execute` until
-/// after `apply_remote_set`. Skip any whose paired MoveRemote landed in
-/// `failed_updates`: the server still has the email at the source,
-/// so committing the DB to the destination would diverge the two
-/// sides and produce a backwards MoveLocal next cycle.
+/// Persist completed placement and full observations only for a submitted,
+/// positively acknowledged MoveRemote. Differing flags retain their old
+/// baseline until the subsequent destination rename succeeds. Agreement can
+/// acknowledge a completed push/no-effect generation with the placement.
 fn apply_move_pair_adopts(
     conn: &Connection,
     actions: Vec<SyncAction>,
-    failed_updates: &HashSet<JmapEmailId>,
-) -> Result<()> {
+    acknowledged_moves: &HashSet<JmapEmailId>,
+) -> Result<usize> {
     if actions.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let txn = conn.unchecked_transaction()?;
+    let mut applied = 0;
     for action in actions {
         let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
             continue;
         };
-        if failed_updates.contains(&id.jmap_email_id) {
+        if !acknowledged_moves.contains(&id.jmap_email_id) {
             warn!(
-                "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
-                 DB retains source folder; the move will be re-detected and re-attempted next cycle.",
+                "Skipping move-pair adopt for {}: membership was not requested and acknowledged; DB retains source binding",
                 id
             );
             continue;
         }
         commit_adopt(&txn, action)?;
+        applied += 1;
     }
     txn.commit()?;
-    Ok(())
+    Ok(applied)
 }
 
 /// Apply the local-side flag updates from a reconcile plan.
@@ -2535,10 +2599,11 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let mut failed: HashSet<JmapEmailId> = HashSet::new();
-        failed.insert(JmapEmailId::from("E1"));
-
-        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+        let acknowledged = HashSet::new();
+        assert_eq!(
+            apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &acknowledged).unwrap(),
+            0
+        );
 
         let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
@@ -2578,9 +2643,11 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let failed: HashSet<JmapEmailId> = HashSet::new();
-
-        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+        let acknowledged = HashSet::from([JmapEmailId::from("E1")]);
+        assert_eq!(
+            apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &acknowledged).unwrap(),
+            1
+        );
 
         let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()

@@ -33,6 +33,7 @@ struct ServerState {
     email_state: String,
     blobs: HashMap<String, Vec<u8>>,
     set_requests: Vec<Value>,
+    blob_requests: usize,
     reject_next_update: usize,
     reject_only_id: Option<String>,
     http_failures: usize,
@@ -221,7 +222,8 @@ async fn mount_blob_downloads(server: &MockServer, state: Arc<Mutex<ServerState>
             let segments: Vec<&str> = url.trim_start_matches('/').split('/').collect();
             // ["download", accountId, blobId, name]
             let blob_id = segments.get(2).copied().unwrap_or_default();
-            let st = state_for_closure.lock().unwrap();
+            let mut st = state_for_closure.lock().unwrap();
+            st.blob_requests += 1;
             match st.blobs.get(blob_id) {
                 Some(bytes) => ResponseTemplate::new(200)
                     .set_body_bytes(bytes.clone())
@@ -1137,6 +1139,539 @@ async fn flag_recovery_mixed_rejection_survives_another_ids_acknowledgement_fail
     assert!(fixture.sync().await.unwrap().already_in_sync);
 }
 
+#[tokio::test]
+async fn flag_move_conflicts_use_the_acknowledged_whole_set_policy() {
+    for (strategy, expected) in [
+        (ConflictStrategy::ServerWins, "FX"),
+        (ConflictStrategy::LocalWins, "SX"),
+    ] {
+        let fixture = FlagFixture::new("", true, strategy).await;
+        assert_eq!(fixture.snapshot().await["acknowledged_flags"], "");
+        fixture.local_change("SX", true, false);
+        fixture.server_change("F", true);
+        let result = fixture.sync().await.unwrap();
+        assert_eq!(result.moved, 1);
+        assert_eq!(result.flag_updates, 1);
+        assert_eq!(
+            (result.downloaded, result.uploaded, result.deleted),
+            (0, 0, 0)
+        );
+        assert_moved_then_idle(&fixture, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn flag_move_refreshes_full_custom_metadata_even_without_owned_changes() {
+    for conflict in [false, true] {
+        let fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+        fixture.local_change("SX", true, false);
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.emails[0].keywords = vec!["$seen".into(), "fresh/a~b".into()];
+            if conflict {
+                state.emails[0].keywords.push("$flagged".into());
+            }
+            advance_email_state(&mut state);
+        }
+        let result = fixture.sync().await.unwrap();
+        assert_eq!(result.moved, 1);
+        assert_moved_then_idle(&fixture, if conflict { "FSX" } else { "SX" }).await;
+        let snapshot = fixture.snapshot().await;
+        assert_eq!(snapshot["cached_keywords"]["fresh/a~b"], true);
+        assert!(snapshot["cached_keywords"].get("keep-me").is_none());
+    }
+}
+
+#[tokio::test]
+async fn flag_move_membership_rejection_does_not_apply_destination_flags() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    fixture.state.lock().unwrap().reject_next_update = 1;
+    let rejected = fixture.sync().await.unwrap();
+    assert_eq!(rejected.failed_remote_actions, 1);
+    assert_eq!(rejected.flag_updates, 0);
+    assert!(!rejected.already_in_sync);
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["file_flags"], "SX");
+    assert_eq!(snapshot["cached_mailbox_id"], "MB-INBOX");
+    assert_eq!(snapshot["server_mailboxes"], json!({"MB-INBOX":true}));
+    assert_eq!(snapshot["server_flags"], "F");
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    fixture.reopen_db();
+    let recovered = fixture.sync().await.unwrap();
+    assert_eq!(recovered.moved, 1);
+    assert_eq!(recovered.flag_updates, 1);
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_membership_ack_then_rename_failure_recovers_at_destination() {
+    use crate::state::flag_sync;
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    let source = fixture.file();
+    let held = fixture.temp.path().join("held-message");
+    fixture.state.lock().unwrap().rename_after_set = Some((source.clone(), held.clone()));
+    let failed = fixture.sync().await.unwrap();
+    assert_eq!(failed.moved, 1);
+    assert_eq!(failed.flag_updates, 0);
+    assert_eq!(failed.pending_flag_actions, 1);
+    assert!(!failed.already_in_sync);
+    assert!(held.exists());
+    let record = queries::get_message_by_jmap_id(&fixture.conn, &"E1".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.jmap_mailbox_id.as_ref(), "MB-TRASH");
+    assert_eq!(record.flags, "F");
+    assert_eq!(
+        serde_json::from_str::<Value>(&record.jmap_keywords).unwrap(),
+        json!({"$flagged":true,"keep-me":true})
+    );
+    let observed = queries::get_local_state(&fixture.conn, record.maildir_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, ("Deleted Items".into(), "SX".into()));
+    let history = flag_sync::get(&fixture.conn, &"E1".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.baseline.as_deref(), Some(""));
+    let attempt = history.attempt.unwrap();
+    assert_eq!(attempt.source_folder.as_deref(), Some("Deleted Items"));
+    assert_eq!(attempt.source_maildir_id, record.maildir_id);
+    assert_eq!(attempt.source_flags, "SX");
+    assert_eq!(attempt.target_flags, "F");
+    std::fs::rename(held, source).unwrap();
+    // No delta is needed: retained flag history must suffice after reopen.
+    let state = fixture.state.lock().unwrap().email_state.clone();
+    queries::set_jmap_state(&fixture.conn, ACCOUNT_ID, "Email", &state).unwrap();
+    fixture.reopen_db();
+    let recovered = fixture.sync().await.unwrap();
+    assert_eq!(
+        recovered.moved, 0,
+        "do not rename the missing old source or move backwards"
+    );
+    assert_eq!(recovered.flag_updates, 1);
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_excluded_membership_does_not_adopt_or_apply_paired_pull() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    let excluded = SyncEngine::pull_only(&fixture.conn, &fixture.config, false)
+        .await
+        .unwrap();
+    assert_eq!(excluded.flag_updates, 0);
+    assert_eq!(excluded.moved, 0);
+    assert!(!excluded.already_in_sync);
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["file_flags"], "SX");
+    assert_eq!(snapshot["cached_mailbox_id"], "MB-INBOX");
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    assert_eq!(snapshot["set_requests"], 0);
+    fixture.reopen_db();
+    fixture.sync().await.unwrap();
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_excluded_pull_retains_history_after_membership_success() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    let excluded = SyncEngine::push_only(&fixture.conn, &fixture.config, false)
+        .await
+        .unwrap();
+    assert_eq!(excluded.flag_updates, 0);
+    assert_eq!(excluded.moved, 1);
+    assert_eq!(excluded.pending_flag_actions, 1);
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["file_flags"], "SX");
+    assert_eq!(snapshot["cached_mailbox_id"], "MB-TRASH");
+    assert_eq!(snapshot["server_flags"], "F");
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    fixture.reopen_db();
+    let recovered = fixture.sync().await.unwrap();
+    assert_eq!(recovered.moved, 0);
+    assert_eq!(recovered.flag_updates, 1);
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_missing_positive_membership_ack_does_not_complete_placement() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    fixture.state.lock().unwrap().omitted_acknowledgements = 1;
+    let ambiguous = fixture.sync().await.unwrap();
+    assert_eq!(ambiguous.failed_remote_actions, 1);
+    assert_eq!(ambiguous.moved, 0);
+    assert_eq!(ambiguous.flag_updates, 0);
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["file_flags"], "SX");
+    assert_eq!(snapshot["cached_mailbox_id"], "MB-INBOX");
+    assert_eq!(snapshot["server_mailboxes"], json!({"MB-TRASH":true}));
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    fixture.reopen_db();
+    fixture.sync().await.unwrap();
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_push_receipt_captures_destination_and_preserves_a_newer_edit() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    let original = fixture.file();
+    let source = original.with_file_name("999999999.moved:2,SX");
+    std::fs::rename(original, &source).unwrap();
+    let id = source
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(":2,")
+        .next()
+        .unwrap();
+    let target = source.with_file_name(format!("{id}:2,X"));
+    fixture.state.lock().unwrap().rename_after_set = Some((source, target));
+    fixture.conn.execute_batch("CREATE TRIGGER abort_move_cache BEFORE UPDATE ON message_map WHEN NEW.flags = 'S' BEGIN SELECT RAISE(FAIL, 'injected post-network move failure'); END;").unwrap();
+    assert!(fixture.sync().await.is_err());
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["server_flags"], "S");
+    assert_eq!(snapshot["file_flags"], "X");
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    assert_eq!(snapshot["flag_attempt"]["source_folder"], "Deleted Items");
+    assert_eq!(
+        snapshot["flag_attempt"]["source_maildir_id"],
+        "999999999.moved"
+    );
+    assert_eq!(snapshot["flag_attempt"]["source_flags"], "SX");
+    fixture
+        .conn
+        .execute_batch("DROP TRIGGER abort_move_cache;")
+        .unwrap();
+    fixture.reopen_db();
+    fixture.sync().await.unwrap();
+    assert_moved_then_idle(&fixture, "X").await;
+}
+
+#[tokio::test]
+async fn flag_move_matrix_local_and_remote_additions_and_removals() {
+    for flag in ['D', 'F', 'P', 'R', 'S', 'T'] {
+        for adding in [false, true] {
+            let letter = flag.to_string();
+            let (initial, desired) = if adding {
+                ("", letter.as_str())
+            } else {
+                (letter.as_str(), "")
+            };
+            for remote in [false, true] {
+                for moved in [false, true] {
+                    for keep_new in [false, true] {
+                        if flag == 'S' && keep_new {
+                            continue;
+                        }
+                        let fixture =
+                            FlagFixture::new(initial, true, ConflictStrategy::ServerWins).await;
+                        fixture.local_change(
+                            if remote { initial } else { desired },
+                            moved,
+                            keep_new,
+                        );
+                        if remote {
+                            fixture.server_change(desired, true);
+                        }
+                        let result = fixture.sync().await.unwrap();
+                        assert_eq!(
+                            result.flag_updates, 1,
+                            "{flag} adding={adding} remote={remote} moved={moved} new={keep_new}"
+                        );
+                        assert_eq!(result.moved, usize::from(moved));
+                        assert_eq!(
+                            (result.downloaded, result.uploaded, result.deleted),
+                            (0, 0, 0)
+                        );
+                        if moved {
+                            assert_moved_then_idle(&fixture, desired).await;
+                        } else {
+                            assert_converged(&fixture, desired).await;
+                            assert!(fixture.sync().await.unwrap().already_in_sync);
+                            assert_converged(&fixture, desired).await;
+                        }
+                        assert_eq!(
+                            fixture.snapshot().await["subdir"],
+                            if keep_new { "new" } else { "cur" }
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn flag_move_dry_run_preserves_observations_history_and_server() {
+    let fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    let before = fixture.snapshot().await;
+    SyncEngine::sync(&fixture.conn, &fixture.config, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture.snapshot().await, before);
+    fixture.sync().await.unwrap();
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_competing_mailbox_destinations_remain_deferred_after_reopen() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.local_change("SX", true, false);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.mailboxes.push(RemoteMailbox {
+            id: "MB-OTHER".into(),
+            name: "Other".into(),
+            role: None,
+            parent_id: None,
+        });
+        state.mailbox_state = "mb-2".into();
+        state.emails[0].mailbox_ids = vec!["MB-OTHER".into()];
+        state.emails[0].keywords = vec!["$flagged".into(), "keep-me".into()];
+        advance_email_state(&mut state);
+    }
+    for _ in 0..2 {
+        let deferred = fixture.sync().await.unwrap();
+        assert_eq!(
+            (
+                deferred.moved,
+                deferred.flag_updates,
+                deferred.downloaded,
+                deferred.deleted
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(deferred.deferred_actions > 0);
+        assert!(!deferred.already_in_sync);
+        let snapshot = fixture.snapshot().await;
+        assert_eq!(snapshot["file_folder"], "Deleted Items");
+        assert_eq!(snapshot["file_flags"], "SX");
+        assert_eq!(snapshot["server_mailboxes"], json!({"MB-OTHER":true}));
+        assert_eq!(snapshot["cached_mailbox_id"], "MB-INBOX");
+        assert_eq!(snapshot["acknowledged_flags"], "");
+        assert_eq!(snapshot["set_requests"], 0);
+        fixture.reopen_db();
+    }
+    // Explicitly resolve placement externally, then let the retained local
+    // move finish without another MUA edit or a body transfer.
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.emails[0].mailbox_ids = vec!["MB-INBOX".into()];
+        advance_email_state(&mut state);
+    }
+    fixture.sync().await.unwrap();
+    assert_moved_then_idle(&fixture, "FX").await;
+}
+
+#[tokio::test]
+async fn flag_move_superseded_move_defers_flags_until_after_folder_policy() {
+    let mut fixture = FlagFixture::new("", true, ConflictStrategy::ServerWins).await;
+    fixture.config.sync.allow_destructive_folder_sync = AllowDestructiveFolderSync::DeleteLocal;
+    fixture.local_change("SX", true, false);
+    fixture.server_change("F", true);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.mailboxes.retain(|mailbox| mailbox.id != "MB-TRASH");
+        state.mailbox_state = "mb-2".into();
+    }
+    let counter = fixture.sync().await.unwrap();
+    assert_eq!(counter.moved, 1);
+    assert_eq!(
+        counter.flag_updates, 0,
+        "a superseded MoveRemote did not authorize a flag effect"
+    );
+    assert!(counter.deferred_actions > 0);
+    let snapshot = fixture.snapshot().await;
+    assert_eq!(snapshot["file_folder"], "INBOX");
+    assert_eq!(snapshot["file_flags"], "SX");
+    assert_eq!(snapshot["acknowledged_flags"], "");
+    assert_eq!(snapshot["server_flags"], "F");
+    assert_eq!(snapshot["set_requests"], 0);
+    fixture.reopen_db();
+    let recovered = fixture.sync().await.unwrap();
+    assert_eq!(recovered.flag_updates, 1);
+    assert_eq!(recovered.moved, 0);
+    for _ in 0..2 {
+        let snapshot = fixture.snapshot().await;
+        assert_eq!(snapshot["file_folder"], "INBOX");
+        assert_eq!(snapshot["file_flags"], "FX");
+        assert_eq!(snapshot["local_observed_flags"], "FX");
+        assert_eq!(snapshot["server_flags"], "F");
+        assert_eq!(snapshot["acknowledged_flags"], "F");
+        assert_eq!(snapshot["cached_keywords"], snapshot["server_keywords"]);
+        assert_eq!(snapshot["blob_requests"], 1);
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+    }
+}
+
+#[tokio::test]
+async fn flag_move_same_folder_rebind_preserves_a_local_only_change() {
+    let fixture = FlagFixture::new("FS", true, ConflictStrategy::ServerWins).await;
+    let original = fixture.file();
+    let renamed = original.with_file_name("999999999.rebound:2,S");
+    std::fs::rename(original, &renamed).unwrap();
+    let result = fixture.sync().await.unwrap();
+    assert_eq!(
+        (result.downloaded, result.uploaded, result.deleted),
+        (0, 0, 0)
+    );
+    assert_eq!(result.flag_updates, 1);
+    assert_eq!(fixture.file(), renamed);
+    assert_converged(&fixture, "S").await;
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+    assert_converged(&fixture, "S").await;
+}
+
+#[tokio::test]
+async fn flag_move_matrix_no_move_conflicts_and_custom_only_refresh() {
+    for (strategy, expected) in [
+        (ConflictStrategy::ServerWins, "F"),
+        (ConflictStrategy::LocalWins, "S"),
+    ] {
+        let fixture = FlagFixture::new("", true, strategy).await;
+        fixture.local_change("S", false, false);
+        fixture.server_change("F", true);
+        fixture.sync().await.unwrap();
+        assert_converged(&fixture, expected).await;
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+    }
+    let fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+    for custom in [Some("fresh-custom"), None] {
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.emails[0].keywords = vec!["$seen".into()];
+            if let Some(keyword) = custom {
+                state.emails[0].keywords.push(keyword.into());
+            }
+            advance_email_state(&mut state);
+        }
+        assert_eq!(fixture.sync().await.unwrap().flag_updates, 0);
+        assert_converged(&fixture, "S").await;
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+    }
+}
+
+#[tokio::test]
+async fn flag_matrix_cold_adoption_transport_failures_survive_reopen() {
+    for fault in ["rejected", "http-exhausted", "lost-replies"] {
+        let mut fixture = FlagFixture::new("FS", true, ConflictStrategy::LocalWins).await;
+        fixture.local_change("S", false, false);
+        fixture.reset_db();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            // Library tests leave the process-wide retry configuration unset.
+            let attempts = crate::jmap::retry::RetryConfig::default().max_attempts as usize;
+            match fault {
+                "rejected" => state.reject_next_update = 1,
+                "http-exhausted" => state.http_failures = attempts,
+                "lost-replies" => state.lost_replies = attempts,
+                _ => unreachable!(),
+            }
+        }
+        let result = fixture.sync().await;
+        if fault == "rejected" {
+            assert_eq!(result.unwrap().failed_remote_actions, 1);
+        } else {
+            assert!(result.is_err(), "{fault} must exhaust transport retries");
+        }
+        assert!(fixture.snapshot().await["acknowledged_flags"].is_null());
+        fixture.reopen_db();
+        fixture.sync().await.unwrap();
+        assert_converged(&fixture, "S").await;
+        assert!(fixture.sync().await.unwrap().already_in_sync);
+        assert_eq!(fixture.snapshot().await["blob_requests"], 1);
+    }
+}
+
+#[tokio::test]
+async fn flag_matrix_ordinary_pull_rename_failure_survives_reopen() {
+    let mut fixture = FlagFixture::new("S", true, ConflictStrategy::ServerWins).await;
+    fixture.server_change("FS", true);
+    let source = fixture.file();
+    let held = fixture.temp.path().join("held-message");
+    fixture.state.lock().unwrap().hide_on_get = Some((source.clone(), held.clone()));
+    let failed = fixture.sync().await.unwrap();
+    assert_eq!(failed.flag_updates, 0);
+    assert_eq!(failed.pending_flag_actions, 1);
+    std::fs::rename(held, source).unwrap();
+    assert_eq!(fixture.snapshot().await["acknowledged_flags"], "S");
+    fixture.reopen_db();
+    assert_eq!(fixture.sync().await.unwrap().flag_updates, 1);
+    assert_converged(&fixture, "FS").await;
+    assert!(fixture.sync().await.unwrap().already_in_sync);
+}
+
+async fn assert_moved(fixture: &FlagFixture, raw_flags: &str) {
+    let snapshot = fixture.snapshot().await;
+    let mapped = crate::state::flag_sync::mapped_flags(raw_flags);
+    assert_eq!(snapshot["file_flags"], raw_flags, "{snapshot}");
+    assert_eq!(snapshot["local_observed_flags"], raw_flags, "{snapshot}");
+    for key in ["server_flags", "cached_flags", "acknowledged_flags"] {
+        assert_eq!(snapshot[key], mapped, "{key}: {snapshot}");
+    }
+    assert_eq!(snapshot["file_folder"], "Deleted Items", "{snapshot}");
+    assert_eq!(snapshot["observed_folder"], "Deleted Items", "{snapshot}");
+    assert_eq!(snapshot["cached_mailbox_id"], "MB-TRASH", "{snapshot}");
+    let file = fixture.file();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        snapshot["cached_maildir_id"],
+        name.split(":2,").next().unwrap()
+    );
+    assert_eq!(
+        snapshot["server_mailboxes"],
+        json!({"MB-TRASH":true}),
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["cached_keywords"], snapshot["server_keywords"],
+        "{snapshot}"
+    );
+    assert_eq!(snapshot["server_email_id"], "E1");
+    assert_eq!(snapshot["server_blob_id"], "B1");
+    assert_eq!(snapshot["cached_blob_id"], "B1");
+    assert_eq!(snapshot["server_thread_id"], "T1");
+    assert_eq!(snapshot["cached_thread_id"], "T1");
+    assert_eq!(
+        snapshot["blob_requests"], 1,
+        "a move must not download the body again"
+    );
+    assert!(snapshot["flag_attempt"].is_null(), "{snapshot}");
+}
+
+async fn assert_moved_then_idle(fixture: &FlagFixture, raw_flags: &str) {
+    assert_moved(fixture, raw_flags).await;
+    let requests = fixture.state.lock().unwrap().set_requests.len();
+    let idle = fixture.sync().await.unwrap();
+    assert!(idle.already_in_sync, "{idle:?}");
+    assert_eq!(idle.pending_flag_actions, 0);
+    assert_eq!(
+        (
+            idle.downloaded,
+            idle.uploaded,
+            idle.deleted,
+            idle.moved,
+            idle.flag_updates
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert_eq!(fixture.state.lock().unwrap().set_requests.len(), requests);
+    assert_moved(fixture, raw_flags).await;
+}
+
 async fn assert_converged(fixture: &FlagFixture, flags: &str) {
     let snapshot = fixture.snapshot().await;
     assert_eq!(snapshot["file_flags"], flags, "{snapshot}");
@@ -1529,10 +2064,10 @@ impl FlagFixture {
             .unwrap()
             .unwrap();
         let cached: Value = serde_json::from_str(&record.jmap_keywords).unwrap();
-        let local_state = queries::get_local_state_for_folder(&self.conn, folder).unwrap();
-        let baseline = local_state
-            .get(record.maildir_id.as_ref().unwrap())
-            .map(|(_, flags)| flags.clone());
+        let local_state =
+            queries::get_local_state(&self.conn, record.maildir_id.as_ref().unwrap()).unwrap();
+        let observed_folder = local_state.as_ref().map(|(folder, _)| folder);
+        let observed_flags = local_state.as_ref().map(|(_, flags)| flags);
         let flag_state = crate::state::flag_sync::get(&self.conn, &"E1".into())
             .unwrap()
             .unwrap();
@@ -1540,8 +2075,11 @@ impl FlagFixture {
         json!({"file_flags":suffix,"file_folder":folder,"subdir":subdir,
             "acknowledged_flags":flag_state.baseline,"flag_attempt":flag_state.attempt,"flags_blocked":flag_state.blocked,
             "server_flags":keywords_to_flags(&remote.keywords),"server_keywords":remote.keywords,
-            "cached_flags":record.flags,"cached_keywords":cached,"local_observed_flags":baseline,
+            "cached_flags":record.flags,"cached_keywords":cached,"local_observed_flags":observed_flags,
+            "observed_folder":observed_folder,"cached_mailbox_id":record.jmap_mailbox_id,
+            "cached_maildir_id":record.maildir_id,"cached_blob_id":record.jmap_blob_id,"cached_thread_id":record.jmap_thread_id,
+            "server_email_id":remote.id,"server_mailboxes":remote.mailbox_ids,"server_blob_id":remote.blob_id,"server_thread_id":remote.thread_id,
             "cursor":queries::get_jmap_state(&self.conn,ACCOUNT_ID,"Email").unwrap(),
-            "server_state":state.email_state,"set_requests":state.set_requests.len()})
+            "server_state":state.email_state,"set_requests":state.set_requests.len(),"blob_requests":state.blob_requests})
     }
 }

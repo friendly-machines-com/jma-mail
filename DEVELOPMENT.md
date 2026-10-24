@@ -226,9 +226,25 @@ being reported as already synchronized. Retryable pending/legacy rows widen
 Paths scans to Full. Full/manual cycles can replan retained discrepancies;
 there is not yet a daemon-owned retry timer or targeted legacy repair CLI.
 Unresolved flag histories hold destructive local-orphan handling, while mere
-metadata observations are not user-change blockers. Move-paired flag policy
-and metadata coordination remain a separate implementation follow-up: these
-flag-only receipts do not acknowledge mailbox placement.
+metadata observations are not user-change blockers. Moves and adoption use
+the same baseline decision as ordinary updates. A move uses the observed
+destination suffix and full fresh remote keywords (or the verified cache),
+not a filename-derived replacement for server metadata. Ordinary adoption
+also prefers fresh full metadata over its cached record when available.
+
+Move-paired destination binding and local flag effects require an actually
+submitted, positively acknowledged membership update, including under direction
+filters. Placement and full observations commit first; a required destination
+flag rename acknowledges flags only after it succeeds. Failure retains the
+old baseline and a destination snapshot receipt so a reopened DB can finish
+without a fresh edit or an old-source rename. Push receipts also capture the
+moved destination, not the stale binding. Failed or excluded placement holds
+the Email cursor so replay retains its fresh metadata. Flag-only receipts do
+not acknowledge mailbox placement. Truly competing selected mailbox
+destinations are deferred for review rather than arbitrarily counter-moved.
+When folder policy replaces a move with a counter-move, its destination flag
+pull is deferred and the cursor held for a post-counter replan, not allowed
+to escape into the ordinary pre-membership flag phase.
 
 ## Concurrency model
 
@@ -336,7 +352,7 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
   - Server claims a Message-ID we already have on disk (after a state DB wipe, or after a half-completed prior run).
   - User dropped a file into a maildir for a message that already exists upstream (would otherwise hit `alreadyExists` on import).
 
-  Adoption belongs to neither side, so `direction()` returns `Both` and `into_filtered` always keeps it: it's strictly forward progress in either pull-only or push-only mode and never costs a network round-trip.
+  Adoption belongs to neither side, so `direction()` returns `Both` and `into_filtered` keeps it. Ordinary adoption is pure DB work. Move-paired adoption is conditional: execute must still verify that its membership update was submitted and acknowledged; retaining it through a direction filter does not establish completion.
 
   `old_maildir_id: Option<MaildirId>` on `AdoptLocalMessage` covers the cross-folder local-move case: the same JMAP id is being rebound from an old maildir_id (about to be removed by the move's paired `DeletedMessage`) to a new one. Execute deletes the stale `local_state` row before upserting the new binding so the next scan doesn't re-emit `DeletedMessage` for the orphan.
 
@@ -396,16 +412,22 @@ Every helper takes an immutable `&ReconcileCtx<'a>` so the parameter lists stay 
 `scan::scan_folder` doesn't know about cross-folder moves: when the user moves a file from `INBOX/cur/X` to `Archive/cur/Y`, scan emits `DeletedMessage(X)` and `NewMessage(Y, message_id=M)`. Reconcile pairs them by Message-ID:
 
 1. For each `DeletedMessage` whose record has a Message-ID, look for a `NewMessage` with the same Message-ID in a different folder.
-2. If found, build a `DetectedMove` capturing both the JMAP-side move (old/new mailbox ids) and the local-side rebind (old/new maildir_ids, prior/new flags).
+2. If found, build a `DetectedMove` capturing the source/destination binding, old/new maildir_ids and actual destination suffix. Index these IDs before remote processing so a simultaneous server update cannot produce a stale-source `MoveLocal`.
 3. Mark both ends as consumed so `process_local_changes` won't emit a separate `DestroyRemote` and `UploadMessage`.
 
-`emit_detected_moves` then writes three actions per detected move:
+`emit_detected_moves` uses `flag_resolution::decide` with the acknowledged
+baseline, destination snapshot, full remote keywords and whole-set policy.
+It emits:
 
-- `MoveRemote` -- change the server-side mailbox membership.
-- `AdoptLocalMessage { old_maildir_id: Some(...) }` -- rebind in DB, drop the orphan local_state row.
-- `UpdateRemoteKeywords` -- only if flags also changed during the move.
+- `MoveRemote` -- change server-side mailbox membership.
+- `AdoptLocalMessage { old_maildir_id: Some(...) }` -- conditionally rebind and drop the old local_state row. Keywords are the full remote observation after applying only the selected owned-bit patch, preserving custom metadata.
+- `UpdateRemoteKeywords` or `UpdateLocalFlags` when the shared decision requires a flag effect. Local flag work addresses the destination and is deferred until membership succeeds.
 
-The whole point of this pass is to avoid the `DestroyRemote + UploadMessage` shape, which would lose the JMAP id, the thread id, and the keyword history.
+Competing selected remote/local mailbox destinations are deferred, with the
+Email cursor held for replay. The pass avoids `DestroyRemote + UploadMessage`,
+which would lose the JMAP id, thread id and keyword history. Genuine new
+adoption uses bootstrap policy; adoption with retained history uses the same
+baseline decision instead of reapplying bootstrap authority.
 
 #### `process_remote_emails`
 
@@ -425,7 +447,7 @@ Delete-vs-update is handled inline; ordinary flag conflicts use the shared basel
   - `ServerWins`: re-download (restores the file). The orphan `local_state` row gets cleaned by the next scan cycle.
   - `LocalWins`: skip the remote-side action; `process_local_changes` will emit `DestroyRemote` unimpeded.
 
-- **flag-vs-flag** -- `flag_resolution::decide` compares both mapped projections with the acknowledged baseline, chooses a whole set, and returns updated history separately from the required effect. `reconcile_bound_flags` emits one flag effect plus independent observation/history actions. Custom-only server metadata changes refresh the ordinary bound-message cache even when mapped flags agree. Move/adoption policy integration is separate.
+- **flag-vs-flag** -- `flag_resolution::decide` compares both mapped projections with the acknowledged baseline, chooses a whole set, and returns updated history separately from the required effect. `reconcile_bound_flags` emits one flag effect plus independent observation/history actions. Custom-only server metadata changes refresh the cache even when mapped flags agree. Moves and adoption use the same resolver through `emit_adoption_flag_reconciliation`; full moved metadata is committed after membership acknowledgement.
 
 `deletes_overruled_by_server` is the cross-pass channel for the `ServerWins` delete case: when path 1 decides server wins,
 `process_local_changes::handle_local_delete` must skip the `DestroyRemote` it would otherwise emit. Without this set the local loop would happily destroy the remote we just decided to re-download.
@@ -458,14 +480,14 @@ Execute is the only place that mutates anything. It buckets the plan by variant,
 ```
 observe / record flag history -> adopt (unconditional) -> download -> local-flags -> local-move ->
 local-delete -> upload -> remote-set (keywords + moves + destroys, batched)
--> adopt (move-paired)
+-> adopt/observe placement (move-paired) -> destination local-flags
 ```
 
 This ordering is load-bearing in a few places:
 
 - **Adopt before everything (mostly).** Unconditional adopts -- those that bind a maildir file to a server email without an associated remote-side move -- run first, because subsequent actions (`UpdateLocalFlags`, `MoveLocal`) may reference the maildir_id / jmap_email_id being bound and only succeed if `message_map` already has the row.
-- **Move-paired adopts run last, after the remote-set batch.** When `AdoptLocalMessage` carries an `old_maildir_id` it is the DB half of a cross-folder local move whose JMAP half was emitted as a `MoveRemote`. Committing the adopt up front would advance the DB to the destination folder; if the paired `MoveRemote` then fails per-id inside `apply_remote_set`, the next reconcile cycle would see a divergence (server still in source, DB in destination) and emit a backwards `MoveLocal` that undoes the user's move. Deferring until after `apply_remote_set` lets `apply_move_pair_adopts` consult the call's `failed_updates` set and skip the adopt for any move-pair the server rejected.
-- **Pull side before push side.** We want the local DB to settle to its post-pull state before we tell the server about local changes -- both because the conflict resolution in reconcile assumed the pull would land first, and because failed pushes leave the DB in a state where the next cycle can still see the original local changes.
+- **Move-paired placement and local flags run after remote-set.** `old_maildir_id` identifies the conditional adoption and its paired destination flag effect. Execute intersects actually submitted move IDs with the adapter's acknowledged results; neither an excluded move nor a rejected/missing ACK authorizes adoption or a destination rename. `apply_move_pair_adopts` commits placement and full observations first, acknowledging flags only on actual agreement (a completed push or no-effect case). Required destination renames then use snapshot validation and acknowledge separately. A rename failure retains destination binding/observations plus unfinished flag history, so the next cycle need not rediscover a move or touch an old source. No later adoption overwrites a successful rename. Unfinished placement holds the Email cursor and counts as deferred work.
+- **Ordinary pull side before push side.** The local DB settles to its post-pull state before ordinary pushes. Move-paired destination flag pulls are the explicit exception: membership must succeed before they can land.
 - **Remote-set batched.** `apply_remote_set` collects every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` for `set_email_batch`. That function merges keyword patches and mailbox replacements for each Email id into one update before splitting by `maxObjectsInSet`; each combined update and each destroy counts as one object. `keywords::KeywordPatch` distinguishes Set/Remove mutations from full keyword observations. `jmap/email_set.rs` sends explicit JSON patches because jmap-client 0.4.1 cannot encode null-valued Email patches: Set becomes true, Remove becomes null, and pointer segments are escaped. A move and its flag changes remain in the same per-object update. The adapter retains connected-client authentication, API URL, timeout, typed JMAP responses and retry classification; HTTP redirects are refused rather than forwarding credentials. An id must appear in the positive updated/destroyed acknowledgement before its operation is mirrored; rejection or missing acknowledgement remains a failed id.
 
 Flag-sync regression tests in `src/sync/flag_tests.rs` run actual `SyncEngine` cycles against real temporary Maildirs and a stateful JMAP model. The model applies patches, rejects invalid keyword values, and exposes fresh `Email/get` results; assertions compare those results with filenames, DB views, and later idle cycles. These tests do not replace the Docker-backed Stalwart tests, which remain a separate integration check.

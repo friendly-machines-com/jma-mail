@@ -600,10 +600,10 @@ impl SyncPlan {
     }
 
     /// Split the plan into (kept, dropped) according to `direction`.
-    /// AdoptLocalMessage is always kept — it is byte-identical and pure
-    /// DB, so adopting in pull-only or push-only mode is still strictly
-    /// progress. Pull-only keeps pull-side actions; push-only keeps
-    /// push-side; Both keeps everything.
+    /// Adoption/history actions are kept in either mode. Execute still gates
+    /// move-paired adoption and destination flags on submitted, acknowledged
+    /// membership; keeping metadata does not acknowledge an excluded effect.
+    /// Pull-only keeps pull-side actions; push-only keeps push-side actions.
     pub fn into_filtered(self, direction: SyncDirection) -> (SyncPlan, Vec<SyncAction>) {
         let SyncPlan {
             actions,
